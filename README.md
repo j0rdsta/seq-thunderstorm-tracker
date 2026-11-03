@@ -42,9 +42,9 @@ Updates install automatically through your userscript manager.
   *"At 12:00 pm, thunderstorms were detected on the weather radar near Gatton … They are forecast to
   affect Laidley … by 12:15 pm and Ipswich, Toowoomba and Kilcoy by 12:30 pm."*, with the Bureau's legend
   icons. An **About the thunderstorm tracker** accordion sits next to BoM's *About this map*.
-- **Experimental storm paths (off by default)**: turn on *Storm paths and 60-minute estimate* in
+- **Experimental storm paths (off by default)**: turn on *Storm paths and 20-minute estimate* in
   settings to see a line showing where each storm has been (from saved tracker images) and a shaded cone
-  with a rough straight-line guess of where it might be in 60 minutes. **This is not a Bureau forecast.**
+  with a rough guess of where it might be in 10 and 20 minutes. **This is not a Bureau forecast.**
   It's a simple extrapolation that ignores storms growing, decaying, splitting, merging or turning, and it
   needs about 15 minutes of saved images. Don't use it to make safety decisions; follow the Bureau's warnings.
 - **Settings in BoM's own dialog**: open **More weather** (or click *Settings* in the status line). Under
@@ -56,7 +56,7 @@ Updates install automatically through your userscript manager.
   - Storm colour: orange, magenta or black
   - Check for updates every 1, 2, 5 or 10 minutes
   - Adjust alignment in 0.5 km steps, in case the overlay looks slightly off
-  - Storm paths and 60-minute estimate (experimental)
+  - Storm paths and 20-minute estimate (experimental)
   - Clear saved images
 
   Settings are saved in your browser.
@@ -83,10 +83,12 @@ Updates install automatically through your userscript manager.
 
 ## Limitations
 
-- **Experimental storm paths are a rough guess.** Cells are matched between images by nearest neighbour
-  (at most 120 km/h), and the estimate is a straight-line fit of the last few positions with an
-  uncertainty cone that widens with time and with how wobbly the path has been.
-
+- **Experimental storm paths are a rough guess.** A storm is only linked between images when the match is
+  unambiguous (similar size, consistent with its recent motion, and clearly the best match both ways).
+  Paths end at merges, splits or missed scans instead of jumping between storms. The estimate uses the
+  median of the storm's recent movements and stops at 20 minutes. In a small backtest (22 outcomes over
+  39 minutes of one afternoon), the typical position error was about 4 km at 5–20 minutes ahead. BoM's own
+  arrows and 10/20/30-minute arcs remain the better guide.
 - The script only runs on bom.gov.au **location pages** (`/location/...`), which is where the radar map is.
   If BoM adds the map to other pages, widen `@match` in the script header.
 

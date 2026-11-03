@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-03
+
+### Changed
+- **More cautious experimental storm paths**, based on a backtest against saved tracker images:
+  - Storms are only linked between images by an unambiguous mutual-best match on motion and size.
+    Paths now end at merges, splits, missed scans or big size changes instead of jumping to a different storm.
+  - The estimate starts from the storm's latest position and uses its median recent velocity, which is
+    less sensitive to a single wobbly position.
+  - The horizon is cut from 60 to **20 minutes** (markers at 10 and 20). Nothing in the data supported 60.
+  - In a small backtest (22 outcomes), mean position error fell from 4.17 to 3.94 km. Direction error
+    didn't improve (16.5° → 18.3°), so the sample is too small to claim more than that.
+
 ## [0.4.0] - 2026-11-03
 
 ### Added

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BoM SEQ Thunderstorm Tracker Overlay
 // @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
-// @version      0.4.0
+// @version      0.5.0
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
@@ -231,59 +231,80 @@
   const TRACK_DEFAULTS = {
     maxSpeedKmh: 120, // faster than this between images = not the same storm
     slackKm: 3, // allowance for the ellipse centre wobbling between images
-    maxGapMin: 15, // a path ends if the storm isn't seen for this long
+    maxGapMin: 10, // end paths after a missing scan
   };
 
   /**
-   * Link cells across frames into paths with greedy nearest-neighbour matching.
+   * Link mutual-best motion/area matches; end paths at ambiguous merges or splits.
    * @param {{t:number, cells:{x:number,y:number,area:number}[]}[]} frameList epoch-ms frames
    * @returns {{points:{t:number,x:number,y:number,area:number}[]}[]}
    */
   function linkTracks(frameList, opts = {}) {
     const o = { ...TRACK_DEFAULTS, ...opts };
-    const sorted = [...frameList].sort((a, b) => a.t - b.t);
+    const last = (tr) => tr.points[tr.points.length - 1];
     const tracks = [];
-    for (const f of sorted) {
-      const open = tracks.filter((tr) => {
-        const last = tr.points[tr.points.length - 1];
-        return f.t > last.t && f.t - last.t <= o.maxGapMin * 60000;
-      });
+    let open = [];
+    for (const f of [...frameList].sort((a, b) => a.t - b.t)) {
       const pairs = [];
       open.forEach((tr, ti) => {
-        const last = tr.points[tr.points.length - 1];
-        const dtMin = (f.t - last.t) / 60000;
-        const maxPx = ((o.maxSpeedKmh / 60) * dtMin + o.slackKm) / KM_PER_PX;
+        const z = last(tr);
+        const dt = (f.t - z.t) / 60000;
+        if (dt <= 0 || dt > o.maxGapMin) return;
+        let vx = 0;
+        let vy = 0;
+        if (tr.points.length > 1) {
+          const p = tr.points[tr.points.length - 2];
+          const span = (z.t - p.t) / 60000;
+          vx = (z.x - p.x) / span;
+          vy = (z.y - p.y) / span;
+        }
         f.cells.forEach((c, ci) => {
-          const d = Math.hypot(c.x - last.x, c.y - last.y);
-          if (d <= maxPx) pairs.push({ d, ti, ci });
+          const ratio = c.area / z.area;
+          const distance = Math.hypot(c.x - z.x, c.y - z.y);
+          const residual = Math.hypot(c.x - z.x - vx * dt, c.y - z.y - vy * dt);
+          if (ratio < 0.4 || ratio > 2.5 ||
+              distance > (o.maxSpeedKmh / 60 * dt + o.slackKm) / KM_PER_PX ||
+              residual > (o.slackKm + 0.7 * dt) / KM_PER_PX) return;
+          pairs.push({ ti, ci, cost: residual + 8 * Math.abs(Math.log(ratio)) });
         });
       });
-      pairs.sort((a, b) => a.d - b.d);
-      const usedT = new Set();
-      const usedC = new Set();
-      for (const { ti, ci } of pairs) {
-        if (usedT.has(ti) || usedC.has(ci)) continue;
-        usedT.add(ti); usedC.add(ci);
-        const c = f.cells[ci];
-        open[ti].points.push({ t: f.t, x: c.x, y: c.y, area: c.area });
+      // Only an unambiguous mutual best match continues a path. Retiring all other
+      // paths avoids forcing an identity through a merge, split or missing detection.
+      const next = [];
+      const used = new Set();
+      for (let ti = 0; ti < open.length; ti++) {
+        const choices = pairs.filter((p) => p.ti === ti).sort((a, b) => a.cost - b.cost);
+        if (!choices.length || (choices[1] && choices[1].cost - choices[0].cost < 5)) continue;
+        const q = choices[0];
+        const rivals = pairs.filter((p) => p.ci === q.ci).sort((a, b) => a.cost - b.cost);
+        if (rivals[0] !== q || (rivals[1] && rivals[1].cost - q.cost < 5)) continue;
+        const tr = open[ti];
+        tr.points.push({ t: f.t, ...f.cells[q.ci] });
+        next.push(tr);
+        used.add(q.ci);
       }
       f.cells.forEach((c, ci) => {
-        if (!usedC.has(ci)) tracks.push({ points: [{ t: f.t, x: c.x, y: c.y, area: c.area }] });
+        if (used.has(ci)) return;
+        const tr = { points: [{ t: f.t, ...c }] };
+        tracks.push(tr);
+        next.push(tr);
       });
+      open = next;
     }
     return tracks;
   }
 
   /**
-   * Straight-line least-squares fit of a path's recent points, extrapolated forward.
+   * Recent median velocity of a path's recent points, extrapolated forward.
    * Needs >= minPoints spanning >= minSpanMin. Uncertainty radius grows with lead time,
    * distance travelled and how badly the points fit a straight line.
    * @returns {null | {vx:number, vy:number, speedKmh:number, predictions:{min:number,x:number,y:number,r:number}[]}}
    */
-  function predictTrack(points, horizonsMin = [30, 60], opts = {}) {
+  function predictTrack(points, horizonsMin = [10, 20], opts = {}) {
     const o = { minPoints: 3, minSpanMin: 10, maxFit: 6, ...TRACK_DEFAULTS, ...opts };
     if (points.length < o.minPoints) return null;
     const pts = points.slice(-o.maxFit);
+    if (pts.some((p, i) => i && p.t <= pts[i - 1].t)) return null;
     const t0 = pts[pts.length - 1].t;
     const ts = pts.map((p) => (p.t - t0) / 60000);
     if (-ts[0] < o.minSpanMin) return null;
@@ -300,12 +321,25 @@
     const speedKmh = Math.hypot(fx.slope, fy.slope) * KM_PER_PX * 60;
     if (speedKmh > o.maxSpeedKmh) return null;
     const rms = Math.sqrt(mean(pts.map((p, i) => (p.x - fx.at(ts[i])) ** 2 + (p.y - fy.at(ts[i])) ** 2)));
-    const predictions = horizonsMin.map((min) => {
+    // Median interval velocity limits the influence of a single centroid wobble.
+    // Keep the fit residual in the uncertainty allowance; anchor at the observed centre.
+    const recent = pts.slice(-4);
+    const velocities = recent.slice(1).map((p, i) => {
+      const dt = (p.t - recent[i].t) / 60000;
+      return [(p.x - recent[i].x) / dt, (p.y - recent[i].y) / dt];
+    });
+    const median = (values) => values.sort((a, b) => a - b)[Math.floor(values.length / 2)];
+    const vx = median(velocities.map((v) => v[0]));
+    const vy = median(velocities.map((v) => v[1]));
+    const robustSpeed = Math.hypot(vx, vy) * KM_PER_PX * 60;
+    if (!Number.isFinite(robustSpeed) || robustSpeed > o.maxSpeedKmh) return null;
+    const last = pts[pts.length - 1];
+    const predictions = horizonsMin.filter((min) => min > 0 && min <= 20).map((min) => {
       const dist = Math.hypot(fx.slope, fy.slope) * min;
       const r = 3 / KM_PER_PX + 0.35 * dist + 2 * rms + 0.05 * min / KM_PER_PX;
-      return { min, x: fx.at(min), y: fy.at(min), r };
+      return { min, x: last.x + vx * min, y: last.y + vy * min, r };
     });
-    return { vx: fx.slope, vy: fy.slope, speedKmh, predictions };
+    return predictions.length ? { vx, vy, speedKmh: robustSpeed, predictions } : null;
   }
 
   /** Duck-type check for an ArcGIS JS 4.x MapView. */
@@ -775,7 +809,7 @@
         ctx.lineWidth = 1.25 * dpr;
         ctx.strokeStyle = `rgba(${ink},0.55)`;
         ctx.stroke();
-        // centre line and a 30-minute marker
+        // centre line and lead-time markers
         ctx.beginPath();
         ctx.moveTo(lx, ly);
         ctx.lineTo(fx, fy);
@@ -1071,7 +1105,7 @@
   function buildInfo() {
     const desc = el('p', {});
     const meta = el('p', { class: 'seq-ts-info__meta' });
-    const pathItem = el('li', {}, [pathSwatch(), 'Storm path and rough 60-minute estimate (experimental, not from the Bureau)']);
+    const pathItem = el('li', {}, [pathSwatch(), 'Storm path and rough 20-minute estimate (experimental, not from the Bureau)']);
     const root = el('div', { class: 'seq-ts-info bom-body', 'data-seq-ts': '' }, [
       el('h3', { class: 'bom-typo bom-typo--s-heading-xs bom-typo--responsive', text: 'Thunderstorm tracker' }),
       desc,
@@ -1103,7 +1137,7 @@
         el('p', { text: 'All thunderstorms produce lightning, and many produce gusty winds, brief heavy showers and hail.' }),
         el('h4', { text: 'Experimental storm paths' }),
         el('p', { text: 'If you turn on storm paths in Map settings, a dark line shows where each tracked storm has been ' +
-          'and a shaded cone shows a rough straight-line estimate of where it might be in 60 minutes. This is a ' +
+          'and a shaded cone shows a rough straight-line estimate of where it might be in 20 minutes. This is a ' +
           'simple calculation by an unofficial browser script, not a Bureau forecast. Storms can speed up, slow ' +
           'down, turn, split, merge, grow or collapse within minutes, so the estimate can be badly wrong. Do not use ' +
           'it to make safety decisions; follow the Bureau’s warnings.' }),
@@ -1253,7 +1287,7 @@
     const sync = makeCheckbox('seq-ts-sync', 'Match the radar timeline', settings.syncTimeline, (v) => {
       settings.syncTimeline = v; saveSettings(); updateAll(true);
     });
-    const tracks = makeCheckbox('seq-ts-tracks', 'Storm paths and 60-minute estimate (experimental)', settings.showTracks, (v) => {
+    const tracks = makeCheckbox('seq-ts-tracks', 'Storm paths and 20-minute estimate (experimental)', settings.showTracks, (v) => {
       settings.showTracks = v; saveSettings(); updateAll(true);
     });
     const area = makeCheckbox('seq-ts-area', 'Show tracker coverage area', settings.showFootprint, (v) => {
@@ -1305,7 +1339,7 @@
       el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive', text:
         'Our own rough straight-line guess from where each storm has been, not a Bureau forecast. Storms can ' +
         'change speed or direction, split, merge or collapse quickly. Don’t rely on it; follow the Bureau’s warnings. ' +
-        'Needs about 15 minutes of saved tracker images.' }),
+        'Needs at least 10 minutes of saved tracker images. Estimates stop at 20 minutes and may disappear when matching is uncertain.' }),
       area.wrap,
       opacity.group, colour.group, interval.group, nudgeGroup, historyGroup,
       el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive' }, [

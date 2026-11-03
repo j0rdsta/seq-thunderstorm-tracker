@@ -196,10 +196,10 @@ test('linkTracks does not link implausibly fast jumps', () => {
 test('predictTrack extrapolates a steady path and widens uncertainty with lead time', () => {
   const min = 60000;
   const pts = [0, 6, 12, 18].map((m) => ({ t: m * min, x: 100 + 2 * m, y: 200 - 1 * m, area: 200 }));
-  const p = core.predictTrack(pts, [30, 60]);
+  const p = core.predictTrack(pts, [10, 20]);
   assert.ok(p);
-  assert.ok(Math.abs(p.predictions[1].x - (136 + 120)) < 0.01, `x ${p.predictions[1].x}`);
-  assert.ok(Math.abs(p.predictions[1].y - (182 - 60)) < 0.01, `y ${p.predictions[1].y}`);
+  assert.ok(Math.abs(p.predictions[1].x - (136 + 40)) < 0.01, `x ${p.predictions[1].x}`);
+  assert.ok(Math.abs(p.predictions[1].y - (182 - 20)) < 0.01, `y ${p.predictions[1].y}`);
   assert.ok(p.predictions[1].r > p.predictions[0].r);
   assert.ok(Math.abs(p.speedKmh - Math.hypot(2, 1) * core.KM_PER_PX * 60) < 1e-6);
   // Too short a history → no estimate.
@@ -216,4 +216,43 @@ test('stormHash ignores colour but changes when the storms move', () => {
   core.chromaKey(c, 'original');
   assert.equal(core.stormHash(a), core.stormHash(b));
   assert.notEqual(core.stormHash(a), core.stormHash(c));
+});
+
+
+test('motion gate preserves identities when two storms cross between scans', () => {
+  const frames = [0, 5, 10, 15].map((m) => ({ t: m * 60000, cells: [
+    { x: 100 + 2 * m, y: 100, area: 100 },
+    { x: 150 - 2 * m, y: 100, area: 100 },
+  ] }));
+  const tracks = core.linkTracks(frames).filter((tr) => tr.points.length === 4);
+  assert.equal(tracks.length, 2);
+  assert.equal(tracks[0].points.at(-1).x, 130);
+  assert.equal(tracks[1].points.at(-1).x, 120);
+});
+
+test('ambiguous merge and split retire paths instead of choosing an identity', () => {
+  const cell = (x, area = 100) => ({ x, y: 100, area });
+  for (const frames of [
+    [{ t: 0, cells: [cell(90), cell(110)] }, { t: 300000, cells: [cell(100, 200)] }],
+    [{ t: 0, cells: [cell(100, 200)] }, { t: 300000, cells: [cell(90), cell(110)] }],
+  ]) assert.ok(core.linkTracks(frames).every((tr) => tr.points.length === 1));
+});
+
+test('a missing scan or large area change starts a fresh path', () => {
+  const cell = (area) => ({ x: 100, y: 100, area });
+  assert.equal(core.linkTracks([{ t: 0, cells: [cell(100)] },
+    { t: 300000, cells: [] }, { t: 600000, cells: [cell(100)] }]).length, 2);
+  assert.equal(core.linkTracks([{ t: 0, cells: [cell(100)] },
+    { t: 300000, cells: [cell(500)] }]).length, 2);
+});
+
+test('median velocity resists centroid wobble and anchors at the latest detection', () => {
+  const points = [0, 10, 20, 36, 40].map((x, i) => ({ t: i * 300000, x, y: 100, area: 100 }));
+  const p = core.predictTrack(points);
+  assert.ok(p);
+  assert.equal(p.vx, 2);
+  assert.equal(p.predictions[0].x, 60);
+  assert.deepEqual(p.predictions.map((q) => q.min), [10, 20]);
+  assert.equal(core.predictTrack(points, [30, 60]), null);
+  assert.equal(core.predictTrack(points.map((q) => ({ ...q, t: 0 }))), null);
 });
