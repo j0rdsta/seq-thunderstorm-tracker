@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 *.log
 .inject*.js
+
+# Local research artefacts (backtests, exported tracker data incl. BoM imagery) - not published
+research/
