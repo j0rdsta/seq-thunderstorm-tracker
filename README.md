@@ -59,6 +59,9 @@ Updates install automatically through your userscript manager.
 
 ## Limitations
 
+- The script only runs on bom.gov.au **location pages** (`/location/...`), which is where the radar map is.
+  If BoM adds the map to other pages, widen `@match` in the script header.
+
 - **Southeast Queensland only.** As far as we know, no other region has a Thunderstorm Tracker product.
 - It depends on undocumented internals of bom.gov.au (React fiber layout, ArcGIS `MapView`) and on
   the tracker image's fixed extent. If BoM redesigns either, the overlay may stop appearing or drift.

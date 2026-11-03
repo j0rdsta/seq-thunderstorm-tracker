@@ -5,7 +5,7 @@
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
-// @match        https://www.bom.gov.au/*
+// @match        https://www.bom.gov.au/location/*
 // @grant        none
 // @run-at       document-idle
 // @noframes

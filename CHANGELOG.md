@@ -10,4 +10,5 @@ All notable changes to this project are documented here. This project uses [Sema
 - Chroma key keeps only the storm cells, movement arrows and forecast arcs.
 - Auto-refresh (30 s – 10 min, default 1 min) using ETag checks; pauses in background tabs.
 - Status chip showing issue time and age, a stale warning, cell count, and an outside-coverage notice.
+- Runs only on bom.gov.au location pages (`/location/*`), where the radar map lives.
 - Settings: on/off (Shift+T), opacity, refresh interval, colour mode, coverage box, alignment nudge.

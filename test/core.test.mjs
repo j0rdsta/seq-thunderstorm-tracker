@@ -126,6 +126,7 @@ test('userscript header is consistent with package.json', () => {
   const meta = (k) => [...header.matchAll(new RegExp(`^// @${k}\\s+(.+)$`, 'gm'))].map((m) => m[1].trim());
   assert.deepEqual(meta('version'), [pkg.version]);
   assert.deepEqual(meta('grant'), ['none']);
+  assert.deepEqual(meta('match'), ['https://www.bom.gov.au/location/*'], 'keep @match narrow');
   const raw = 'https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker.user.js';
   assert.deepEqual(meta('updateURL'), [raw]);
   assert.deepEqual(meta('downloadURL'), [raw]);
