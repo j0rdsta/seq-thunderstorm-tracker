@@ -162,3 +162,58 @@ test('pickTrackerFrame pairs radar frames with the tracker image issued just aft
   assert.equal(core.pickTrackerFrame([at('12:31')], at('11:55')), null);
   assert.equal(core.pickTrackerFrame([], at('12:25')), null);
 });
+
+test('findCells returns centroids of filled cells', () => {
+  const cells = core.findCells(synth(100, 100, [[20, 30, 8], [70, 60, 10]]), 100, 100);
+  assert.equal(cells.length, 2);
+  const a = cells.find((c) => c.x < 50);
+  assert.ok(Math.abs(a.x - 20) < 0.5 && Math.abs(a.y - 30) < 0.5);
+});
+
+test('linkTracks follows two storms moving in parallel and starts a new path for a newcomer', () => {
+  const min = 60000;
+  // ~2.4 px/min ≈ 60 km/h eastwards for both storms.
+  const frames = [0, 6, 12, 18].map((m) => ({
+    t: m * min,
+    cells: [{ x: 100 + 2.4 * m, y: 100, area: 200 }, { x: 100 + 2.4 * m, y: 300, area: 200 }],
+  }));
+  frames[3].cells.push({ x: 500, y: 500, area: 100 });
+  const tracks = core.linkTracks(frames);
+  const long = tracks.filter((t) => t.points.length === 4);
+  assert.equal(long.length, 2);
+  assert.equal(tracks.length, 3);
+  for (const t of long) assert.ok(new Set(t.points.map((p) => Math.round(p.y))).size === 1, 'no cross-linking');
+});
+
+test('linkTracks does not link implausibly fast jumps', () => {
+  const tracks = core.linkTracks([
+    { t: 0, cells: [{ x: 0, y: 0, area: 100 }] },
+    { t: 6 * 60000, cells: [{ x: 200, y: 0, area: 100 }] }, // 84 km in 6 min
+  ]);
+  assert.equal(tracks.length, 2);
+});
+
+test('predictTrack extrapolates a steady path and widens uncertainty with lead time', () => {
+  const min = 60000;
+  const pts = [0, 6, 12, 18].map((m) => ({ t: m * min, x: 100 + 2 * m, y: 200 - 1 * m, area: 200 }));
+  const p = core.predictTrack(pts, [30, 60]);
+  assert.ok(p);
+  assert.ok(Math.abs(p.predictions[1].x - (136 + 120)) < 0.01, `x ${p.predictions[1].x}`);
+  assert.ok(Math.abs(p.predictions[1].y - (182 - 60)) < 0.01, `y ${p.predictions[1].y}`);
+  assert.ok(p.predictions[1].r > p.predictions[0].r);
+  assert.ok(Math.abs(p.speedKmh - Math.hypot(2, 1) * core.KM_PER_PX * 60) < 1e-6);
+  // Too short a history → no estimate.
+  assert.equal(core.predictTrack(pts.slice(0, 2)), null);
+  assert.equal(core.predictTrack(pts.slice(0, 3).map((q, i) => ({ ...q, t: i * 60000 }))), null);
+});
+
+test('stormHash ignores colour but changes when the storms move', () => {
+  const a = synth(60, 60, [[20, 20, 6]]);
+  const b = synth(60, 60, [[20, 20, 6]]);
+  const c = synth(60, 60, [[24, 20, 6]]);
+  core.chromaKey(a, 'original');
+  core.chromaKey(b, 'magenta');
+  core.chromaKey(c, 'original');
+  assert.equal(core.stormHash(a), core.stormHash(b));
+  assert.notEqual(core.stormHash(a), core.stormHash(c));
+});

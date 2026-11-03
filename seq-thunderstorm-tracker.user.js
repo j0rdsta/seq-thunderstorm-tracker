@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BoM SEQ Thunderstorm Tracker Overlay
 // @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
-// @version      0.3.0
+// @version      0.4.0
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
@@ -163,38 +163,149 @@
     return kept;
   }
 
+  /**
+   * Fingerprint of the storm drawing in a chroma-keyed RGBA buffer (FNV-1a over which pixels are
+   * storm pixels). BoM re-renders the image every minute with a new "Issued at" stamp, but the
+   * storms only change with each new radar scan (~5 min); this tells those apart.
+   */
+  function stormHash(keyed) {
+    let h = 0x811c9dc5;
+    for (let i = 3, p = 0; i < keyed.length; i += 4, p++) {
+      if (keyed[i]) {
+        h ^= p & 0xff; h = Math.imul(h, 0x01000193);
+        h ^= p >>> 8; h = Math.imul(h, 0x01000193);
+      }
+    }
+    return (h >>> 0).toString(16);
+  }
+
   /** Is this pixel part of a storm cell's filled ellipse (current position)? */
   function isCellFill(r, g, b) {
     const [h, s] = rgbToHs(r, g, b);
     return h >= 18 && h <= 38 && s >= 0.3 && s <= 0.55 && r >= 200;
   }
 
-  /** Count filled storm cells (connected components above minPixels). Operates on the ORIGINAL pixels. */
-  function countCells(data, w, h, minPixels = 40) {
+  /**
+   * Find filled storm cells (current positions) as connected components of the fill colour.
+   * Operates on the ORIGINAL pixels. Returns [{ x, y, area }] with centroids in image px.
+   */
+  function findCells(data, w, h, minPixels = 40) {
     const mask = new Uint8Array(w * h);
     for (let i = 0, p = 0; p < w * h; i += 4, p++) {
       if (data[i + 3] && isCellFill(data[i], data[i + 1], data[i + 2])) mask[p] = 1;
     }
-    let count = 0;
+    const cells = [];
     const stack = [];
     for (let p = 0; p < w * h; p++) {
       if (mask[p] !== 1) continue;
       mask[p] = 2;
       stack.push(p);
       let size = 0;
+      let sx = 0;
+      let sy = 0;
       while (stack.length) {
         const q = stack.pop();
-        size++;
         const x = q % w;
         const y = (q - x) / w;
+        size++; sx += x; sy += y;
         if (x > 0 && mask[q - 1] === 1) { mask[q - 1] = 2; stack.push(q - 1); }
         if (x < w - 1 && mask[q + 1] === 1) { mask[q + 1] = 2; stack.push(q + 1); }
         if (y > 0 && mask[q - w] === 1) { mask[q - w] = 2; stack.push(q - w); }
         if (y < h - 1 && mask[q + w] === 1) { mask[q + w] = 2; stack.push(q + w); }
       }
-      if (size >= minPixels) count++;
+      if (size >= minPixels) cells.push({ x: sx / size, y: sy / size, area: size });
     }
-    return count;
+    return cells;
+  }
+
+  function countCells(data, w, h, minPixels = 40) {
+    return findCells(data, w, h, minPixels).length;
+  }
+
+  // ----- Experimental storm paths ------------------------------------------------
+  // Our own rough estimate, NOT a Bureau product: link storm cells across saved tracker
+  // images into paths, then extrapolate in a straight line with a widening uncertainty cone.
+
+  const KM_PER_PX = 0.42; // ground distance of one tracker-image pixel at ~27.5°S
+
+  const TRACK_DEFAULTS = {
+    maxSpeedKmh: 120, // faster than this between images = not the same storm
+    slackKm: 3, // allowance for the ellipse centre wobbling between images
+    maxGapMin: 15, // a path ends if the storm isn't seen for this long
+  };
+
+  /**
+   * Link cells across frames into paths with greedy nearest-neighbour matching.
+   * @param {{t:number, cells:{x:number,y:number,area:number}[]}[]} frameList epoch-ms frames
+   * @returns {{points:{t:number,x:number,y:number,area:number}[]}[]}
+   */
+  function linkTracks(frameList, opts = {}) {
+    const o = { ...TRACK_DEFAULTS, ...opts };
+    const sorted = [...frameList].sort((a, b) => a.t - b.t);
+    const tracks = [];
+    for (const f of sorted) {
+      const open = tracks.filter((tr) => {
+        const last = tr.points[tr.points.length - 1];
+        return f.t > last.t && f.t - last.t <= o.maxGapMin * 60000;
+      });
+      const pairs = [];
+      open.forEach((tr, ti) => {
+        const last = tr.points[tr.points.length - 1];
+        const dtMin = (f.t - last.t) / 60000;
+        const maxPx = ((o.maxSpeedKmh / 60) * dtMin + o.slackKm) / KM_PER_PX;
+        f.cells.forEach((c, ci) => {
+          const d = Math.hypot(c.x - last.x, c.y - last.y);
+          if (d <= maxPx) pairs.push({ d, ti, ci });
+        });
+      });
+      pairs.sort((a, b) => a.d - b.d);
+      const usedT = new Set();
+      const usedC = new Set();
+      for (const { ti, ci } of pairs) {
+        if (usedT.has(ti) || usedC.has(ci)) continue;
+        usedT.add(ti); usedC.add(ci);
+        const c = f.cells[ci];
+        open[ti].points.push({ t: f.t, x: c.x, y: c.y, area: c.area });
+      }
+      f.cells.forEach((c, ci) => {
+        if (!usedC.has(ci)) tracks.push({ points: [{ t: f.t, x: c.x, y: c.y, area: c.area }] });
+      });
+    }
+    return tracks;
+  }
+
+  /**
+   * Straight-line least-squares fit of a path's recent points, extrapolated forward.
+   * Needs >= minPoints spanning >= minSpanMin. Uncertainty radius grows with lead time,
+   * distance travelled and how badly the points fit a straight line.
+   * @returns {null | {vx:number, vy:number, speedKmh:number, predictions:{min:number,x:number,y:number,r:number}[]}}
+   */
+  function predictTrack(points, horizonsMin = [30, 60], opts = {}) {
+    const o = { minPoints: 3, minSpanMin: 10, maxFit: 6, ...TRACK_DEFAULTS, ...opts };
+    if (points.length < o.minPoints) return null;
+    const pts = points.slice(-o.maxFit);
+    const t0 = pts[pts.length - 1].t;
+    const ts = pts.map((p) => (p.t - t0) / 60000);
+    if (-ts[0] < o.minSpanMin) return null;
+    const mean = (a) => a.reduce((s, v) => s + v, 0) / a.length;
+    const mt = mean(ts);
+    const stt = ts.reduce((s, t) => s + (t - mt) ** 2, 0);
+    const fit = (vals) => {
+      const mv = mean(vals);
+      const slope = ts.reduce((s, t, i) => s + (t - mt) * (vals[i] - mv), 0) / stt;
+      return { slope, at: (t) => mv + slope * (t - mt) };
+    };
+    const fx = fit(pts.map((p) => p.x));
+    const fy = fit(pts.map((p) => p.y));
+    const speedKmh = Math.hypot(fx.slope, fy.slope) * KM_PER_PX * 60;
+    if (speedKmh > o.maxSpeedKmh) return null;
+    const rms = Math.sqrt(mean(pts.map((p, i) => (p.x - fx.at(ts[i])) ** 2 + (p.y - fy.at(ts[i])) ** 2)));
+    const predictions = horizonsMin.map((min) => {
+      const dist = Math.hypot(fx.slope, fy.slope) * min;
+      const r = 3 / KM_PER_PX + 0.35 * dist + 2 * rms + 0.05 * min / KM_PER_PX;
+      return { min, x: fx.at(min), y: fy.at(min), r };
+    });
+    return { vx: fx.slope, vy: fy.slope, speedKmh, predictions };
   }
 
   /** Duck-type check for an ArcGIS JS 4.x MapView. */
@@ -317,7 +428,8 @@
   const core = {
     IMAGE_URL, TRACKER_PAGE, IMAGE_W, IMAGE_H, CORNERS,
     lonLatToMercator, imageToMercatorAffine, applyAffine, invertAffine, imageToScreenTransform,
-    footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, isCellFill, countCells,
+    footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, stormHash, isCellFill, countCells, findCells,
+    KM_PER_PX, linkTracks, predictTrack,
     looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatAgeLong, formatIssued,
     parseTimelineLabel, pickTrackerFrame,
   };
@@ -339,6 +451,7 @@
     colour: 'original',
     showFootprint: false,
     syncTimeline: true, // show the saved tracker image matching the radar frame on screen
+    showTracks: false, // experimental storm paths + straight-line estimate (not a Bureau product)
     nudge: { dx: 0, dy: 0 },
   };
   const STALE_MS = 20 * 60 * 1000;
@@ -370,6 +483,8 @@
     inflight: false,
     lastRequestAt: 0,
     badSize: null,
+    description: null, // "Current Tracking Description" text from the tracker page
+    frameT: null, // key (epoch ms) of the saved frame holding the latest storm drawing
   };
 
   /** @type {Map<object, Attachment>} */
@@ -420,14 +535,24 @@
       state.badSize = null;
       const issued = lm ? new Date(lm) : new Date();
       const frame = { blob, ...keyBitmap(bmp) };
-      frames.set(issued.getTime(), frame);
-      pruneFrames();
-      history.put({ issued: issued.getTime(), blob, cells: frame.cells });
+      const prevT = latestFrameTime();
+      const prev = prevT !== null ? frames.get(prevT) : null;
+      const changed = !prev || prev.hash !== frame.hash;
+      if (changed) {
+        // New storm drawing: save it, keyed by when it first appeared.
+        frames.set(issued.getTime(), frame);
+        pruneFrames();
+        history.put({ issued: issued.getTime(), blob, hash: frame.hash });
+        state.frameT = issued.getTime();
+      } else {
+        state.frameT = prevT; // same storms, just a newer "Issued at" stamp
+      }
       state.etag = etag;
       state.issued = issued;
       state.cells = frame.cells;
-      state.bitmap = frame.canvas;
+      state.bitmap = frames.get(state.frameT).canvas;
       state.error = null;
+      if (changed || !state.description) fetchDescription();
     } catch (err) {
       state.error = err && err.name === 'AbortError' ? 'request timed out' : String(err && err.message || err);
       console.warn('[SEQ tracker] refresh failed:', err);
@@ -446,10 +571,10 @@
     const ctx = c.getContext('2d', { willReadFrequently: true });
     ctx.drawImage(bmp, 0, 0);
     const img = ctx.getImageData(0, 0, c.width, c.height);
-    const cells = countCells(img.data, c.width, c.height);
+    const cellList = findCells(img.data, c.width, c.height);
     chromaKey(img.data, settings.colour);
     ctx.putImageData(img, 0, 0);
-    return { canvas: c, cells };
+    return { canvas: c, cells: cellList.length, cellList, hash: stormHash(img.data) };
   }
 
   /** Re-key every saved image (after a colour change). */
@@ -458,10 +583,30 @@
       try {
         const { canvas } = keyBitmap(await createImageBitmap(f.blob));
         f.canvas = canvas;
-        if (state.issued && t === state.issued.getTime()) state.bitmap = canvas;
+        if (t === state.frameT) state.bitmap = canvas;
       } catch (_) { frames.delete(t); }
     }
     updateAll(true);
+  }
+
+  function latestFrameTime() {
+    let best = null;
+    for (const t of frames.keys()) if (best === null || t > best) best = t;
+    return best;
+  }
+
+  /** Keep only the first frame of each run of identical storm drawings. */
+  function dedupeFrames() {
+    let lastHash = null;
+    for (const t of [...frames.keys()].sort((a, b) => a - b)) {
+      const f = frames.get(t);
+      if (f.hash === lastHash) {
+        frames.delete(t);
+        if (state.frameT === t) state.frameT = latestFrameTime();
+      } else lastHash = f.hash;
+    }
+    if (state.frameT !== null && !frames.has(state.frameT)) state.frameT = latestFrameTime();
+    if (state.frameT !== null) state.bitmap = frames.get(state.frameT).canvas;
   }
 
   function pruneFrames() {
@@ -526,25 +671,27 @@
         frames.set(rec.issued, { blob: rec.blob, ...keyBitmap(bmp) });
       } catch (_) { /* skip unreadable */ }
     }
+    dedupeFrames();
     pruneFrames();
     updateAll(true);
   }
 
   async function clearHistory() {
     await history.clear();
-    for (const t of [...frames.keys()]) if (!state.issued || t !== state.issued.getTime()) frames.delete(t);
+    for (const t of [...frames.keys()]) if (t !== state.frameT) frames.delete(t);
     updateAll(true);
   }
 
-  /** Which keyed image to draw for a given radar frame time (null = nothing to show). */
+  /** Which saved image ({ t, canvas }) to draw for a radar frame time (null = nothing to show). */
   function imageForFrame(frameTime) {
-    if (!settings.syncTimeline || !frameTime) return state.bitmap;
+    const latest = state.bitmap && state.frameT !== null ? { t: state.frameT, canvas: state.bitmap } : null;
+    if (!settings.syncTimeline || !frameTime) return latest;
     const f = frameTime.getTime();
     const t = pickTrackerFrame([...frames.keys()], f);
-    if (t !== null) return frames.get(t).canvas;
+    if (t !== null) return { t, canvas: frames.get(t).canvas };
     // Newest radar frames (or a radar feed running a little behind the tracker): use the latest image.
-    if (state.issued && f >= state.issued.getTime() - 12 * 60000 && f <= state.issued.getTime() + 30 * 60000) {
-      return state.bitmap;
+    if (latest && f >= latest.t - 12 * 60000 && f <= latest.t + 30 * 60000) {
+      return latest;
     }
     return null;
   }
@@ -561,6 +708,115 @@
         Date.now() - state.lastRequestAt >= settings.intervalSec * 1000) refresh();
     schedule();
   });
+
+  // ----- tracking description (text from the tracker page) ---------------------
+
+  async function fetchDescription() {
+    try {
+      const res = await fetch(TRACKER_PAGE, { cache: 'no-cache' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      // The tracker page is an older Latin-1 page; DOMParser documents are inert (no scripts/images).
+      const html = new TextDecoder('windows-1252').decode(await res.arrayBuffer());
+      const node = new DOMParser().parseFromString(html, 'text/html').getElementById('forecasttext');
+      state.description = node ? node.textContent.replace(/\s+/g, ' ').trim() : null;
+    } catch (err) {
+      console.warn('[SEQ tracker] could not load tracking description:', err);
+    }
+    updateAll(false);
+  }
+
+  // ----- experimental storm paths (drawing) ---------------------------------------
+
+  let tracksKey = '';
+  let tracksCache = [];
+  function getTracks() {
+    const key = [...frames.keys()].sort((a, b) => a - b).join(',');
+    if (key !== tracksKey) {
+      tracksKey = key;
+      tracksCache = linkTracks([...frames].map(([t, f]) => ({ t, cells: f.cellList || [] })));
+    }
+    return tracksCache;
+  }
+
+  /** Draw paths (up to the displayed frame) and straight-line estimate cones, in screen space. */
+  function drawTracks(ctx, t, dpr, frameT) {
+    const S = (x, y) => [(t.a * x + t.c * y + t.e) * dpr, (t.b * x + t.d * y + t.f) * dpr];
+    const scale = Math.hypot(t.a, t.b) * dpr; // device px per image px
+    const ink = '30,30,30';
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    for (const tr of getTracks()) {
+      const pts = tr.points.filter((p) => p.t <= frameT);
+      if (!pts.length || pts[pts.length - 1].t !== frameT) continue;
+      const last = pts[pts.length - 1];
+      const [lx, ly] = S(last.x, last.y);
+      const pred = predictTrack(pts);
+      if (pred) {
+        const far = pred.predictions[pred.predictions.length - 1];
+        const [fx, fy] = S(far.x, far.y);
+        const r0 = (3 / KM_PER_PX) * scale;
+        const r1 = far.r * scale;
+        const d = Math.hypot(fx - lx, fy - ly);
+        ctx.beginPath();
+        if (d > Math.abs(r1 - r0)) {
+          const th = Math.atan2(fy - ly, fx - lx);
+          const phi = Math.asin((r1 - r0) / d);
+          ctx.arc(fx, fy, r1, th - Math.PI / 2 - phi, th + Math.PI / 2 + phi);
+          ctx.arc(lx, ly, r0, th + Math.PI / 2 + phi, th + Math.PI * 1.5 - phi);
+        } else {
+          ctx.arc(fx, fy, Math.max(r0, r1), 0, Math.PI * 2);
+        }
+        ctx.closePath();
+        ctx.fillStyle = `rgba(${ink},0.10)`;
+        ctx.fill();
+        ctx.setLineDash([4 * dpr, 4 * dpr]);
+        ctx.lineWidth = 1.25 * dpr;
+        ctx.strokeStyle = `rgba(${ink},0.55)`;
+        ctx.stroke();
+        // centre line and a 30-minute marker
+        ctx.beginPath();
+        ctx.moveTo(lx, ly);
+        ctx.lineTo(fx, fy);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        for (const pr of pred.predictions) {
+          const [px, py] = S(pr.x, pr.y);
+          ctx.beginPath();
+          ctx.arc(px, py, 2.5 * dpr, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(${ink},0.7)`;
+          ctx.fill();
+        }
+        ctx.font = `${11 * dpr}px Inter, Inter-fallback, sans-serif`;
+        ctx.textBaseline = 'middle';
+        ctx.lineWidth = 3 * dpr;
+        ctx.strokeStyle = 'rgba(255,255,255,0.9)';
+        ctx.fillStyle = `rgb(${ink})`;
+        const label = `~${far.min} min?`;
+        ctx.strokeText(label, fx + 4 * dpr, fy);
+        ctx.fillText(label, fx + 4 * dpr, fy);
+      }
+      if (pts.length > 1) {
+        ctx.beginPath();
+        pts.forEach((p, i) => { const [x, y] = S(p.x, p.y); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+        ctx.lineWidth = 4.5 * dpr;
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.stroke();
+        ctx.lineWidth = 2 * dpr;
+        ctx.strokeStyle = `rgb(${ink})`;
+        ctx.stroke();
+        for (const p of pts.slice(0, -1)) {
+          const [x, y] = S(p.x, p.y);
+          ctx.beginPath();
+          ctx.arc(x, y, 2.5 * dpr, 0, Math.PI * 2);
+          ctx.fillStyle = `rgb(${ink})`;
+          ctx.fill();
+        }
+      }
+    }
+    ctx.restore();
+  }
 
   // ----- per-view attachment -------------------------------------------------
 
@@ -598,6 +854,7 @@
       const v = this.view;
       const c = v.center;
       if (!statusLine.root.isConnected) placeStatus();
+      if (!info.root.isConnected || !info.about.isConnected) placeInfo(this);
       if (c) {
         const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}|${this.timelineText()}`;
         if (key !== this.last) {
@@ -653,8 +910,9 @@
       ctx.imageSmoothingEnabled = true;
       if (image) {
         ctx.globalAlpha = settings.opacity;
-        ctx.drawImage(image, 0, 0);
+        ctx.drawImage(image.canvas, 0, 0);
         ctx.globalAlpha = 1;
+        if (settings.showTracks) drawTracks(ctx, t, dpr, image.t);
       }
       if (settings.showFootprint) {
         ctx.save();
@@ -677,7 +935,7 @@
       cancelAnimationFrame(this.raf);
       this.canvas.remove();
       attachments.delete(this.view);
-      if (!attachments.size) statusLine.root.remove();
+      if (!attachments.size) { statusLine.root.remove(); info.root.remove(); info.about.remove(); }
       schedule();
     }
   }
@@ -685,6 +943,15 @@
   // ----- UI (reuses bom.gov.au markup and classes) ---------------------------
 
   const CSS = `
+  .seq-ts-info{margin:24px 0 8px}
+  .seq-ts-info[hidden]{display:none}
+  .seq-ts-info h3{margin:0 0 4px}
+  .seq-ts-info__legend{list-style:none;padding:0;margin:12px 0 0;display:flex;flex-wrap:wrap;gap:8px 24px;
+    font-size:14px;line-height:20px;color:#4a4a4a}
+  .seq-ts-info__legend li{display:flex;align-items:center;gap:8px;margin:0}
+  .seq-ts-info__legend li[hidden]{display:none}
+  .seq-ts-info__legend img,.seq-ts-info__legend svg{height:24px;width:auto;flex:none}
+  .seq-ts-info .seq-ts-info__meta{margin-top:8px;font-size:14px;line-height:20px}
   .seq-ts-meta__warn{color:#b3261e}
   .seq-ts-meta__actions{display:inline-flex;gap:10px;margin-left:10px}
   .seq-ts-linkbtn{all:unset;cursor:pointer;text-decoration:underline;text-underline-offset:2px;color:inherit}
@@ -754,6 +1021,9 @@
         if (att && att.inCoverage === false) extra.push('map is outside Southeast Queensland');
         else extra.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} storm cell${state.cells === 1 ? '' : 's'}`);
         if (settings.syncTimeline && frames.size > 1) extra.push(`${frames.size} images saved for the radar loop`);
+        if (settings.showTracks) {
+          extra.push(frames.size < 3 ? 'storm paths need about 15 minutes of saved images' : 'experimental storm paths on');
+        }
         if (state.error) { extra.push('refresh failed'); warn = true; }
         msg += ` (${extra.join(', ')})`;
       }
@@ -780,6 +1050,142 @@
     if (!att) return;
     const anchor = (att.section && att.section.querySelector('.bom-scrub')) || att.container;
     if (anchor.parentElement) anchor.insertAdjacentElement('afterend', statusLine.root);
+  }
+
+  // ----- Tracking description + "About the thunderstorm tracker" accordion ------
+
+  const REPO_URL = 'https://github.com/j0rdsta/seq-thunderstorm-tracker';
+  const ABOUT_PAGE = 'https://www.bom.gov.au/weather-services/about/thunderstorm-tracker.shtml';
+
+  function pathSwatch() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 48 24');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.innerHTML = '<path d="M30 12 L44 4 A9 9 0 0 1 44 20 Z" fill="rgba(30,30,30,.1)" stroke="rgba(30,30,30,.55)" stroke-dasharray="3 3"/>' +
+      '<path d="M4 16 L16 13 L28 12" fill="none" stroke="#1e1e1e" stroke-width="2" stroke-linecap="round"/>' +
+      '<circle cx="4" cy="16" r="2.5" fill="#1e1e1e"/><circle cx="16" cy="13" r="2.5" fill="#1e1e1e"/>';
+    return svg;
+  }
+
+  function buildInfo() {
+    const desc = el('p', {});
+    const meta = el('p', { class: 'seq-ts-info__meta' });
+    const pathItem = el('li', {}, [pathSwatch(), 'Storm path and rough 60-minute estimate (experimental, not from the Bureau)']);
+    const root = el('div', { class: 'seq-ts-info bom-body', 'data-seq-ts': '' }, [
+      el('h3', { class: 'bom-typo bom-typo--s-heading-xs bom-typo--responsive', text: 'Thunderstorm tracker' }),
+      desc,
+      el('ul', { class: 'seq-ts-info__legend' }, [
+        el('li', {}, [el('img', { src: '/images/patifs/storm_cell.png', alt: '' }), 'Tracked thunderstorms']),
+        el('li', {}, [el('img', { src: '/images/patifs/storm_direction.png', alt: '' }), 'Estimated movement and positions in 10, 20 and 30 minutes']),
+        pathItem,
+      ]),
+      meta,
+    ]);
+
+    // Accordion: clone BoM's "About this map" header so icons/caret match, then wire our own toggle.
+    const panelId = 'seq-ts-about-panel';
+    const panel = el('div', { class: 'bom-accordion-panel', id: panelId, 'data-seq-ts': '' }, [
+      el('div', { class: 'bom-body' }, [el('div', {}, [
+        el('h4', { text: 'What the tracker shows' }),
+        el('p', { text: 'The Thunderstorm Tracker is an automated pilot product from the Bureau of Meteorology. It looks for ' +
+          'areas of intense rainfall in the last two to three radar scans and shows likely thunderstorms as ovals. ' +
+          'Arrows show the direction each storm is heading, and the three curves ahead of it show its expected ' +
+          'position in 10, 20 and 30 minutes. It updates every 6 minutes, covers Southeast Queensland only, and is not a warning.' }),
+        el('h4', { text: 'Severe thunderstorm warnings' }),
+        el('p', { text: 'The Bureau issues Severe Thunderstorm Warnings when storms are expected to produce any of the following:' }),
+        el('ul', {}, [
+          el('li', { text: 'damaging wind gusts (90 km/h or more)' }),
+          el('li', { text: 'large hail (2 cm diameter or more)' }),
+          el('li', { text: 'very heavy rainfall that could cause flash flooding' }),
+          el('li', { text: 'tornadoes' }),
+        ]),
+        el('p', { text: 'All thunderstorms produce lightning, and many produce gusty winds, brief heavy showers and hail.' }),
+        el('h4', { text: 'Experimental storm paths' }),
+        el('p', { text: 'If you turn on storm paths in Map settings, a dark line shows where each tracked storm has been ' +
+          'and a shaded cone shows a rough straight-line estimate of where it might be in 60 minutes. This is a ' +
+          'simple calculation by an unofficial browser script, not a Bureau forecast. Storms can speed up, slow ' +
+          'down, turn, split, merge, grow or collapse within minutes, so the estimate can be badly wrong. Do not use ' +
+          'it to make safety decisions; follow the Bureau’s warnings.' }),
+        el('h4', { text: 'About this add-on' }),
+        el('p', {}, [
+          'The overlay, this section and the storm paths are added by ',
+          el('a', { href: REPO_URL, target: '_blank', rel: 'noopener', text: 'an unofficial open-source browser script' }),
+          '. It is not affiliated with or endorsed by the Bureau. Tracker images and text © Commonwealth of Australia, Bureau of Meteorology. See the ',
+          el('a', { href: TRACKER_PAGE, target: '_blank', rel: 'noopener', text: 'official Thunderstorm Tracker' }),
+          ' and ',
+          el('a', { href: ABOUT_PAGE, target: '_blank', rel: 'noopener', text: 'how it works' }),
+          '.',
+        ]),
+      ])]),
+    ]);
+    let header = null;
+    function makeHeader() {
+      const tpl = document.querySelector('.about-map-accordion.bom-accordion-header');
+      let h;
+      if (tpl) {
+        h = tpl.cloneNode(true);
+        h.classList.remove('about-map-accordion', 'bom-accordion-header--open');
+        h.removeAttribute('data-testid');
+        const title = h.querySelector('.accordion-title');
+        const textNode = title && [...title.childNodes].reverse().find((n) => n.nodeType === 3);
+        if (textNode) textNode.textContent = 'About the thunderstorm tracker';
+        else if (title) title.append('About the thunderstorm tracker');
+      } else {
+        h = el('div', { class: 'bom-accordion-header' }, [
+          el('div', { class: 'bom-accordion-header__label' }, [el('span', { class: 'accordion-title', text: 'About the thunderstorm tracker' })]),
+        ]);
+      }
+      h.classList.add('seq-ts-about');
+      h.setAttribute('data-seq-ts', '');
+      h.setAttribute('role', 'button');
+      h.setAttribute('tabindex', '0');
+      h.setAttribute('aria-controls', panelId);
+      h.setAttribute('aria-expanded', 'false');
+      const toggle = (ev) => {
+        ev.stopPropagation();
+        const open = h.getAttribute('aria-expanded') !== 'true';
+        h.setAttribute('aria-expanded', String(open));
+        h.classList.toggle('bom-accordion-header--open', open);
+        panel.classList.toggle('bom-accordion-panel--open', open);
+      };
+      h.addEventListener('click', toggle);
+      h.addEventListener('keydown', (ev) => {
+        if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); toggle(ev); }
+      });
+      return h;
+    }
+    const about = el('div', { class: 'seq-ts-about-wrap', 'data-seq-ts': '' });
+
+    function update() {
+      root.hidden = !settings.enabled;
+      about.hidden = !settings.enabled;
+      if (!header) { header = makeHeader(); about.append(header, panel); }
+      desc.textContent = state.description ||
+        (state.error && !state.bitmap ? 'The tracking description is unavailable right now.' : 'Loading the tracking description…');
+      pathItem.hidden = !settings.showTracks;
+      meta.textContent = state.issued
+        ? `From the Bureau’s Thunderstorm Tracker, ${formatIssued(state.issued)}. Not a warning – check current warnings for your area.`
+        : '';
+    }
+    return { root, about, update };
+  }
+
+  const info = buildInfo();
+
+  /** Description under the map; "About" accordion after BoM's "About this map". */
+  function placeInfo(att) {
+    ensureStyles();
+    const section = att.section;
+    if (!section) return;
+    const wrapper = section.querySelector('.bom-spatial-map__wrapper') || att.container;
+    if (!info.root.isConnected && wrapper.parentElement) wrapper.insertAdjacentElement('afterend', info.root);
+    const bomPanel = section.querySelector('#about-map-accordion');
+    if (!info.about.isConnected) {
+      info.update();
+      if (bomPanel) bomPanel.insertAdjacentElement('afterend', info.about);
+      else info.root.insertAdjacentElement('afterend', info.about);
+    }
   }
 
   // ----- "More weather" modal section -----------------------------------------
@@ -847,6 +1253,9 @@
     const sync = makeCheckbox('seq-ts-sync', 'Match the radar timeline', settings.syncTimeline, (v) => {
       settings.syncTimeline = v; saveSettings(); updateAll(true);
     });
+    const tracks = makeCheckbox('seq-ts-tracks', 'Storm paths and 60-minute estimate (experimental)', settings.showTracks, (v) => {
+      settings.showTracks = v; saveSettings(); updateAll(true);
+    });
     const area = makeCheckbox('seq-ts-area', 'Show tracker coverage area', settings.showFootprint, (v) => {
       settings.showFootprint = v; saveSettings(); updateAll(true);
     });
@@ -892,6 +1301,11 @@
         'publishes the latest image, so earlier ones are saved in this browser while the page is open (last 2 hours). ',
         savedOut,
       ]),
+      tracks.wrap,
+      el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive', text:
+        'Our own rough straight-line guess from where each storm has been, not a Bureau forecast. Storms can ' +
+        'change speed or direction, split, merge or collapse quickly. Don’t rely on it; follow the Bureau’s warnings. ' +
+        'Needs about 15 minutes of saved tracker images.' }),
       area.wrap,
       opacity.group, colour.group, interval.group, nudgeGroup, historyGroup,
       el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive' }, [
@@ -908,6 +1322,7 @@
       if (!fieldset.isConnected) { modalUpdate = null; return; }
       show.input.checked = settings.enabled;
       sync.input.checked = settings.syncTimeline;
+      tracks.input.checked = settings.showTracks;
       savedOut.textContent = `${frames.size} image${frames.size === 1 ? '' : 's'} saved.`;
       area.input.checked = settings.showFootprint;
       opacity.set(settings.opacity);
@@ -924,6 +1339,7 @@
       if (redraw) { att.last = ''; att.draw(); }
     }
     statusLine.update();
+    info.update();
     if (modalUpdate) modalUpdate();
   }
 
@@ -949,6 +1365,7 @@
       attachments.set(view, new Attachment(view));
       placeStatus();
       if (!historyLoaded) { historyLoaded = true; loadHistory(); }
+      placeInfo(attachments.get(view));
       if (!state.bitmap && settings.enabled) refresh();
       schedule();
       updateAll(false);

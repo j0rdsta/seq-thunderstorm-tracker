@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-03
+
+### Added
+- **Tracking description under the map**: the tracker page's plain-English summary ("At 12:00 pm,
+  thunderstorms were detected near … forecast to affect … by 12:30 pm") appears below the radar map
+  with BoM's own legend icons, in the page's body text styles. It refreshes whenever a new tracker image is published.
+- **"About the thunderstorm tracker" accordion** next to BoM's "About this map". It covers what the tracker
+  shows, BoM's severe thunderstorm warning criteria, the experimental paths and attribution.
+- **Experimental storm paths** (off by default): links storm cells across saved tracker images into
+  paths and draws a rough straight-line estimate of where each might be in 60 minutes, as a widening
+  cone. It's labelled as unofficial and not for safety decisions everywhere it appears.
+
+### Fixed
+- Saved history no longer fills up with duplicates. BoM re-renders the tracker image every minute (only the
+  "Issued at" stamp changes), so images are now compared by their storm content and only real updates
+  (about every 5 minutes) are kept.
+
 ## [0.3.0] - 2026-11-03
 
 ### Added

@@ -31,12 +31,22 @@ Updates install automatically through your userscript manager.
   you still see the radar underneath.
 - **Plays along with the radar loop**: as BoM's radar loop plays (or you drag the timeline), the overlay
   switches to the tracker image issued for that radar time, so you can watch storms move. BoM only
-  publishes the *latest* tracker image (it updates every 6 minutes), so the script saves each one in your
-  browser as it arrives (IndexedDB, last 2 hours, up to 30 images, about 3 MB). That means the history
+  publishes the *latest* tracker image, so the script saves each new storm picture in your
+  browser as it arrives. BoM re-renders the image every minute, but the storms only change with each radar
+  scan (about every 5 minutes), so duplicate frames are skipped (IndexedDB, last 2 hours, up to 30 images, about 3 MB). That means the history
   only covers time when you had a BoM page open; radar frames without a saved image show no overlay.
 - **"Last updated" line**: below the map, alongside BoM's *Observations* and *Forecast* lines, e.g.
   `Thunderstorm tracker: 1 minute ago, 12:42 pm AEST (16 storm cells, 6 images saved for the radar loop)`,
   with *Refresh*, *Hide/Show* and *Settings* links. It turns red if the tracker hasn't updated for 20 minutes.
+- **Tracking description**: below the map, the tracker's plain-English summary from the Bureau, e.g.
+  *"At 12:00 pm, thunderstorms were detected on the weather radar near Gatton … They are forecast to
+  affect Laidley … by 12:15 pm and Ipswich, Toowoomba and Kilcoy by 12:30 pm."*, with the Bureau's legend
+  icons. An **About the thunderstorm tracker** accordion sits next to BoM's *About this map*.
+- **Experimental storm paths (off by default)**: turn on *Storm paths and 60-minute estimate* in
+  settings to see a line showing where each storm has been (from saved tracker images) and a shaded cone
+  with a rough straight-line guess of where it might be in 60 minutes. **This is not a Bureau forecast.**
+  It's a simple extrapolation that ignores storms growing, decaying, splitting, merging or turning, and it
+  needs about 15 minutes of saved images. Don't use it to make safety decisions; follow the Bureau's warnings.
 - **Settings in BoM's own dialog**: open **More weather** (or click *Settings* in the status line). Under
   *Map settings* there's a **Thunderstorm tracker (SEQ pilot)** section built from the site's own controls:
   - Thunderstorm tracker on/off (also **Shift+T**)
@@ -46,6 +56,7 @@ Updates install automatically through your userscript manager.
   - Storm colour: orange, magenta or black
   - Check for updates every 1, 2, 5 or 10 minutes
   - Adjust alignment in 0.5 km steps, in case the overlay looks slightly off
+  - Storm paths and 60-minute estimate (experimental)
   - Clear saved images
 
   Settings are saved in your browser.
@@ -71,6 +82,10 @@ Updates install automatically through your userscript manager.
   buttons if it looks off.
 
 ## Limitations
+
+- **Experimental storm paths are a rough guess.** Cells are matched between images by nearest neighbour
+  (at most 120 km/h), and the estimate is a straight-line fit of the last few positions with an
+  uncertainty cone that widens with time and with how wobbly the path has been.
 
 - The script only runs on bom.gov.au **location pages** (`/location/...`), which is where the radar map is.
   If BoM adds the map to other pages, widen `@match` in the script header.
