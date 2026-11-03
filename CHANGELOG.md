@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-03
+
+### Added
+- **Radar loop playback**: each tracker image is saved in the browser (IndexedDB, last 2 hours, up to 30
+  images), and the overlay shows the image that matches the radar time on screen as BoM's loop plays or
+  you scrub. BoM only publishes the latest image, so history builds up while a BoM page is open. There's
+  a "Match the radar timeline" option (on by default) and a "Clear saved images" button.
+
+### Changed
+- The tracker status now appears as a line in BoM's **Last updated** block below the map, in the same
+  wording as the other lines (`Thunderstorm tracker: 1 minute ago, 12:42 pm AEST (16 storm cells)`).
+- Replaced "Hide when paused on an earlier radar time" with the timeline matching above.
+
 ## [0.2.0] - 2026-11-03
 
 ### Added

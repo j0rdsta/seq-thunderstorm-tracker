@@ -29,19 +29,24 @@ Updates install automatically through your userscript manager.
 - **Aligned overlay**: storm cells, movement arrows and forecast arcs are drawn on the radar map in the
   right place at every zoom level. The tracker's basemap (land, sea, borders, labels) is keyed out, so
   you still see the radar underneath.
-- **Status under the radar timeline**: a line in the same style as BoM's timeline label, e.g.
-  `Thunderstorm tracker 12:31pm AEST (2 min ago) · 17 storm cells   Refresh  Hide  Settings`.
-  It warns when the tracker hasn't updated for 20 minutes and says when you've panned outside Southeast
-  Queensland.
+- **Plays along with the radar loop**: as BoM's radar loop plays (or you drag the timeline), the overlay
+  switches to the tracker image issued for that radar time, so you can watch storms move. BoM only
+  publishes the *latest* tracker image (it updates every 6 minutes), so the script saves each one in your
+  browser as it arrives (IndexedDB, last 2 hours, up to 30 images, about 3 MB). That means the history
+  only covers time when you had a BoM page open; radar frames without a saved image show no overlay.
+- **"Last updated" line**: below the map, alongside BoM's *Observations* and *Forecast* lines, e.g.
+  `Thunderstorm tracker: 1 minute ago, 12:42 pm AEST (16 storm cells, 6 images saved for the radar loop)`,
+  with *Refresh*, *Hide/Show* and *Settings* links. It turns red if the tracker hasn't updated for 20 minutes.
 - **Settings in BoM's own dialog**: open **More weather** (or click *Settings* in the status line). Under
   *Map settings* there's a **Thunderstorm tracker (SEQ pilot)** section built from the site's own controls:
   - Thunderstorm tracker on/off (also **Shift+T**)
-  - Hide when paused on an earlier radar time (on by default; the overlay stays visible while the loop plays)
+  - Match the radar timeline (on by default); turn off to always show the latest image
   - Show tracker coverage area (dashed outline)
   - Overlay opacity: 50%, 85% or 100%
   - Storm colour: orange, magenta or black
   - Check for updates every 1, 2, 5 or 10 minutes
   - Adjust alignment in 0.5 km steps, in case the overlay looks slightly off
+  - Clear saved images
 
   Settings are saved in your browser.
 - **Auto-refresh** with a cheap HTTP revalidation, so the image is only downloaded when BoM publishes

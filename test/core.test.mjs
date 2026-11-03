@@ -132,9 +132,13 @@ test('userscript header is consistent with package.json', () => {
   assert.deepEqual(meta('downloadURL'), [raw]);
 });
 
-test('formatIssued matches BoM style in Queensland time', () => {
-  assert.equal(core.formatIssued(new Date('2026-11-03T02:26:40Z')), '12:26pm AEST');
-  assert.equal(core.formatIssued(new Date('2026-11-02T21:05:00Z')), '7:05am AEST');
+test('formatIssued and formatAgeLong match BoM "Last updated" wording', () => {
+  assert.equal(core.formatIssued(new Date('2026-11-03T02:26:40Z')), '12:26 pm AEST');
+  assert.equal(core.formatIssued(new Date('2026-11-02T21:05:00Z')), '7:05 am AEST');
+  assert.equal(core.formatAgeLong(20_000), 'less than a minute ago');
+  assert.equal(core.formatAgeLong(61_000), '1 minute ago');
+  assert.equal(core.formatAgeLong(9 * 60_000), '9 minutes ago');
+  assert.equal(core.formatAgeLong(125 * 60_000), '2 hours ago');
 });
 
 test('parseTimelineLabel reads the radar timeline label', () => {
@@ -148,10 +152,13 @@ test('parseTimelineLabel reads the radar timeline label', () => {
   assert.equal(core.parseTimelineLabel('Thursday 31 Dec, 11:55pm AEST', jan).getUTCFullYear(), 2026);
 });
 
-test('frameMatchesTracker hides the overlay for old or forecast radar frames', () => {
-  const issued = new Date('2026-11-03T02:26:00Z');
-  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T02:20:00Z'), issued), true);
-  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T01:40:00Z'), issued), false);
-  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T05:00:00Z'), issued), false);
-  assert.equal(core.frameMatchesTracker(null, issued), true);
+test('pickTrackerFrame pairs radar frames with the tracker image issued just after them', () => {
+  const at = (hhmm) => Date.parse(`2026-11-03T${hhmm}:00+10:00`);
+  const saved = ['12:07', '12:13', '12:19', '12:25', '12:31'].map(at);
+  assert.equal(core.pickTrackerFrame(saved, at('12:25')), at('12:31'));
+  assert.equal(core.pickTrackerFrame(saved, at('12:20')), at('12:25'));
+  assert.equal(core.pickTrackerFrame(saved, at('12:05')), at('12:07'));
+  // Nothing saved near an older radar frame → null (overlay hidden for that frame).
+  assert.equal(core.pickTrackerFrame([at('12:31')], at('11:55')), null);
+  assert.equal(core.pickTrackerFrame([], at('12:25')), null);
 });

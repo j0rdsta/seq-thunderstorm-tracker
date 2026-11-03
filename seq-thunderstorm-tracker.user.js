@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BoM SEQ Thunderstorm Tracker Overlay
 // @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
-// @version      0.2.0
+// @version      0.3.0
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
@@ -256,12 +256,21 @@
     return `${h} h ${mins % 60} min ago`;
   }
 
-  /** Format like BoM's own labels: "12:26pm AEST" (Queensland time, no daylight saving). */
+  /** Format like BoM's "Last updated" lines: "12:26 pm AEST" (Queensland time, no daylight saving). */
   function formatIssued(date) {
     const t = date.toLocaleTimeString('en-AU', {
       timeZone: 'Australia/Brisbane', hour: 'numeric', minute: '2-digit', hour12: true,
     });
-    return `${t.replace(/\s+/g, '').toLowerCase()} AEST`;
+    return `${t.replace(/\s+/g, ' ').toLowerCase()} AEST`;
+  }
+
+  /** Relative age in BoM's wording: "9 minutes ago", "2 hours ago". */
+  function formatAgeLong(ms) {
+    const mins = Math.floor(ms / 60000);
+    if (mins < 1) return 'less than a minute ago';
+    if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'} ago`;
+    const h = Math.floor(mins / 60);
+    return `${h} hour${h === 1 ? '' : 's'} ago`;
   }
 
   const TZ_OFFSETS_MIN = { AEST: 600, AEDT: 660, ACST: 570, ACDT: 630, AWST: 480 };
@@ -287,18 +296,30 @@
     return best;
   }
 
-  /** Does a radar frame time match the tracker issue time closely enough to overlay it? */
-  function frameMatchesTracker(frame, issued, toleranceMs = 15 * 60000) {
-    if (!frame || !issued) return true; // unknown → don't hide
-    return Math.abs(frame.getTime() - issued.getTime()) <= toleranceMs;
+  /**
+   * Choose the saved tracker image that belongs with a radar frame.
+   * The tracker is issued every ~6 min from the latest radar scans, so the image for the radar
+   * frame at time F is typically issued a few minutes after F. Picks the issue time closest to
+   * F + leadMs, within toleranceMs; returns null when nothing saved is close enough.
+   * @param {number[]} issuedTimes epoch ms
+   * @param {number} frameMs epoch ms of the radar frame
+   */
+  function pickTrackerFrame(issuedTimes, frameMs, leadMs = 5 * 60000, toleranceMs = 7 * 60000) {
+    let best = null;
+    let bestDiff = Infinity;
+    for (const t of issuedTimes) {
+      const diff = Math.abs(t - (frameMs + leadMs));
+      if (diff <= toleranceMs && diff < bestDiff) { best = t; bestDiff = diff; }
+    }
+    return best;
   }
 
   const core = {
     IMAGE_URL, TRACKER_PAGE, IMAGE_W, IMAGE_H, CORNERS,
     lonLatToMercator, imageToMercatorAffine, applyAffine, invertAffine, imageToScreenTransform,
     footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, isCellFill, countCells,
-    looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatIssued,
-    parseTimelineLabel, frameMatchesTracker,
+    looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatAgeLong, formatIssued,
+    parseTimelineLabel, pickTrackerFrame,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
@@ -317,12 +338,14 @@
     intervalSec: 60,
     colour: 'original',
     showFootprint: false,
-    onlyLatest: true, // hide while the radar loop is paused on a past/forecast frame
+    syncTimeline: true, // show the saved tracker image matching the radar frame on screen
     nudge: { dx: 0, dy: 0 },
   };
   const STALE_MS = 20 * 60 * 1000;
   const MIN_REQUEST_GAP_MS = 30 * 1000;
   const FETCH_TIMEOUT_MS = 20 * 1000;
+  const HISTORY_MS = 2 * 60 * 60 * 1000; // keep tracker images for the last 2 hours
+  const HISTORY_MAX = 30;
 
   const settings = loadSettings();
   function loadSettings() {
@@ -337,8 +360,7 @@
   }
 
   const state = {
-    bitmap: null, // keyed canvas
-    rawData: null, // ImageData of original image (for re-keying on colour change)
+    bitmap: null, // keyed canvas of the latest image
     etag: null,
     issued: null,
     cells: null,
@@ -352,6 +374,9 @@
 
   /** @type {Map<object, Attachment>} */
   const attachments = new Map();
+
+  /** Saved tracker images by issue time (epoch ms): { blob, canvas (keyed), cells }. */
+  const frames = new Map();
 
   function geo() {
     return imageToMercatorAffine(CORNERS, IMAGE_W, IMAGE_H, settings.nudge);
@@ -388,22 +413,20 @@
         // The georeference only holds for the known image layout; don't draw misplaced storms.
         state.etag = etag;
         state.bitmap = null;
-        state.rawData = null;
         state.cells = null;
         state.badSize = `${bmp.width}×${bmp.height}`;
         throw new Error(`tracker image changed size (${state.badSize}); overlay disabled until the script is updated`);
       }
       state.badSize = null;
-      const c = document.createElement('canvas');
-      c.width = bmp.width;
-      c.height = bmp.height;
-      const ctx = c.getContext('2d', { willReadFrequently: true });
-      ctx.drawImage(bmp, 0, 0);
-      state.rawData = ctx.getImageData(0, 0, c.width, c.height);
+      const issued = lm ? new Date(lm) : new Date();
+      const frame = { blob, ...keyBitmap(bmp) };
+      frames.set(issued.getTime(), frame);
+      pruneFrames();
+      history.put({ issued: issued.getTime(), blob, cells: frame.cells });
       state.etag = etag;
-      state.issued = lm ? new Date(lm) : null;
-      state.cells = countCells(state.rawData.data, c.width, c.height);
-      rekey();
+      state.issued = issued;
+      state.cells = frame.cells;
+      state.bitmap = frame.canvas;
       state.error = null;
     } catch (err) {
       state.error = err && err.name === 'AbortError' ? 'request timed out' : String(err && err.message || err);
@@ -415,15 +438,115 @@
     }
   }
 
-  function rekey() {
-    if (!state.rawData) return;
-    const copy = new ImageData(new Uint8ClampedArray(state.rawData.data), state.rawData.width, state.rawData.height);
-    chromaKey(copy.data, settings.colour);
+  /** Decode → chroma-key → canvas, plus the storm cell count. */
+  function keyBitmap(bmp) {
     const c = document.createElement('canvas');
-    c.width = copy.width;
-    c.height = copy.height;
-    c.getContext('2d').putImageData(copy, 0, 0);
-    state.bitmap = c;
+    c.width = bmp.width;
+    c.height = bmp.height;
+    const ctx = c.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    const img = ctx.getImageData(0, 0, c.width, c.height);
+    const cells = countCells(img.data, c.width, c.height);
+    chromaKey(img.data, settings.colour);
+    ctx.putImageData(img, 0, 0);
+    return { canvas: c, cells };
+  }
+
+  /** Re-key every saved image (after a colour change). */
+  async function rekey() {
+    for (const [t, f] of frames) {
+      try {
+        const { canvas } = keyBitmap(await createImageBitmap(f.blob));
+        f.canvas = canvas;
+        if (state.issued && t === state.issued.getTime()) state.bitmap = canvas;
+      } catch (_) { frames.delete(t); }
+    }
+    updateAll(true);
+  }
+
+  function pruneFrames() {
+    const cutoff = Date.now() - HISTORY_MS;
+    const times = [...frames.keys()].sort((a, b) => a - b);
+    times.forEach((t, i) => {
+      if (t < cutoff || i < times.length - HISTORY_MAX) frames.delete(t);
+    });
+  }
+
+  // ----- saved history (IndexedDB) ----------------------------------------------
+  // BoM only publishes the latest tracker image, so the script keeps its own short history
+  // to play back alongside the radar loop. Images are only saved while a BoM page is open.
+
+  const history = (() => {
+    const DB = 'seq-thunderstorm-tracker';
+    const STORE = 'frames';
+    let dbp = null;
+    const req = (r) => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+    function open() {
+      if (!dbp) {
+        dbp = new Promise((res, rej) => {
+          const r = indexedDB.open(DB, 1);
+          r.onupgradeneeded = () => r.result.createObjectStore(STORE, { keyPath: 'issued' });
+          r.onsuccess = () => res(r.result);
+          r.onerror = () => rej(r.error);
+        }).catch((err) => { console.warn('[SEQ tracker] history unavailable:', err); return null; });
+      }
+      return dbp;
+    }
+    async function store(mode) {
+      const db = await open();
+      return db ? db.transaction(STORE, mode).objectStore(STORE) : null;
+    }
+    return {
+      async put(rec) {
+        try {
+          const s = await store('readwrite');
+          if (!s) return;
+          await req(s.put(rec));
+          await req(s.delete(IDBKeyRange.upperBound(Date.now() - HISTORY_MS)));
+        } catch (err) { console.warn('[SEQ tracker] could not save image:', err); }
+      },
+      async all() {
+        try {
+          const s = await store('readonly');
+          return s ? await req(s.getAll(IDBKeyRange.lowerBound(Date.now() - HISTORY_MS))) : [];
+        } catch (_) { return []; }
+      },
+      async clear() {
+        try { const s = await store('readwrite'); if (s) await req(s.clear()); } catch (_) { /* ignore */ }
+      },
+    };
+  })();
+
+  async function loadHistory() {
+    for (const rec of await history.all()) {
+      if (frames.has(rec.issued)) continue;
+      try {
+        const bmp = await createImageBitmap(rec.blob);
+        if (bmp.width !== IMAGE_W || bmp.height !== IMAGE_H) continue;
+        frames.set(rec.issued, { blob: rec.blob, ...keyBitmap(bmp) });
+      } catch (_) { /* skip unreadable */ }
+    }
+    pruneFrames();
+    updateAll(true);
+  }
+
+  async function clearHistory() {
+    await history.clear();
+    for (const t of [...frames.keys()]) if (!state.issued || t !== state.issued.getTime()) frames.delete(t);
+    updateAll(true);
+  }
+
+  /** Which keyed image to draw for a given radar frame time (null = nothing to show). */
+  function imageForFrame(frameTime) {
+    if (!settings.syncTimeline || !frameTime) return state.bitmap;
+    const f = frameTime.getTime();
+    const t = pickTrackerFrame([...frames.keys()], f);
+    if (t !== null) return frames.get(t).canvas;
+    // Newest radar frames (or a radar feed running a little behind the tracker): use the latest image.
+    if (state.issued && f >= state.issued.getTime() - 12 * 60000 && f <= state.issued.getTime() + 30 * 60000) {
+      return state.bitmap;
+    }
+    return null;
   }
 
   function schedule() {
@@ -459,8 +582,6 @@
       else this.container.appendChild(this.canvas);
 
       this.section = this.container.closest('.bom-spatial-map') || this.container.parentElement;
-      this.status = buildStatusLine(this);
-      this.placeStatus();
       this.frameHidden = false;
 
       this.loop = this.loop.bind(this);
@@ -476,9 +597,9 @@
       if (!this.alive()) { this.destroy(); return; }
       const v = this.view;
       const c = v.center;
-      if (!this.status.root.isConnected) this.placeStatus();
+      if (!statusLine.root.isConnected) placeStatus();
       if (c) {
-        const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}|${this.timelineText()}|${this.timelinePlaying()}`;
+        const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}|${this.timelineText()}`;
         if (key !== this.last) {
           this.last = key;
           this.draw();
@@ -487,22 +608,9 @@
       this.raf = requestAnimationFrame(this.loop);
     }
 
-    /** Put the status line directly under the radar timeline (or under the map as a fallback). */
-    placeStatus() {
-      const scrub = this.section && this.section.querySelector('.bom-scrub');
-      const anchor = scrub || this.container;
-      if (anchor.parentElement) anchor.insertAdjacentElement('afterend', this.status.root);
-    }
-
     timelineText() {
       const label = this.section && this.section.querySelector('.bom-scrub-display-label');
       return label ? label.textContent : '';
-    }
-
-    /** BoM's play/pause button reads "Pause" while the radar loop is animating. */
-    timelinePlaying() {
-      const btn = this.section && this.section.querySelector('.bom-scrub-action__label');
-      return !!btn && /pause/i.test(btn.textContent);
     }
 
     draw() {
@@ -522,12 +630,9 @@
       ctx.clearRect(0, 0, cw, ch);
       // The center/resolution box is only exact for north-up views; don't cull rotated ones.
       this.inCoverage = !!e && (!!v.rotation || intersects(footprintBounds(geo()), e));
-      this.frameTime = parseTimelineLabel(this.timelineText());
-      // While the loop plays, keep the overlay steady rather than blinking on the newest frame only.
-      this.frameHidden = settings.onlyLatest && !this.timelinePlaying() && !!state.issued &&
-        !frameMatchesTracker(this.frameTime, state.issued);
-      this.status.update();
-      if (!settings.enabled || !e || !this.inCoverage || this.frameHidden) return;
+      const image = imageForFrame(parseTimelineLabel(this.timelineText()));
+      this.frameHidden = !!state.bitmap && !image;
+      if (!settings.enabled || !e || !this.inCoverage) return;
       if (e.spatialReference && e.spatialReference.wkid && ![102100, 3857, 900913].includes(e.spatialReference.wkid)) return;
 
       const g = geo();
@@ -546,9 +651,9 @@
       }
       ctx.setTransform(t.a * dpr, t.b * dpr, t.c * dpr, t.d * dpr, t.e * dpr, t.f * dpr);
       ctx.imageSmoothingEnabled = true;
-      if (state.bitmap) {
+      if (image) {
         ctx.globalAlpha = settings.opacity;
-        ctx.drawImage(state.bitmap, 0, 0);
+        ctx.drawImage(image, 0, 0);
         ctx.globalAlpha = 1;
       }
       if (settings.showFootprint) {
@@ -571,8 +676,8 @@
     destroy() {
       cancelAnimationFrame(this.raf);
       this.canvas.remove();
-      this.status.root.remove();
       attachments.delete(this.view);
+      if (!attachments.size) statusLine.root.remove();
       schedule();
     }
   }
@@ -580,11 +685,8 @@
   // ----- UI (reuses bom.gov.au markup and classes) ---------------------------
 
   const CSS = `
-  .seq-ts-status{display:flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:2px 12px;
-    padding:6px 0 0;font-family:Inter,Inter-fallback,sans-serif;font-size:12px;line-height:16px;color:#4a4a4a}
-  .seq-ts-status__swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;
-    vertical-align:-1px;background:#f5bd8a;box-shadow:inset 0 0 0 1.5px #cc7833}
-  .seq-ts-status__text--warn{color:#b3261e}
+  .seq-ts-meta__warn{color:#b3261e}
+  .seq-ts-meta__actions{display:inline-flex;gap:10px;margin-left:10px}
   .seq-ts-linkbtn{all:unset;cursor:pointer;text-decoration:underline;text-underline-offset:2px;color:inherit}
   .seq-ts-linkbtn:hover{text-decoration-thickness:2px}
   .seq-ts-linkbtn:focus-visible{outline:2px solid currentColor;outline-offset:2px;border-radius:2px}
@@ -621,47 +723,63 @@
     if (btn) btn.click();
   }
 
-  /** Status line under the radar timeline, styled like BoM's timeline label. */
-  function buildStatusLine(att) {
-    ensureStyles();
+  /**
+   * One line in BoM's "Last updated" block below the map, written like its other lines
+   * ("Observations: 9 minutes ago, 12:20 pm AEST"). Falls back to just under the map.
+   */
+  function buildStatusLine() {
     const text = el('span', { 'aria-live': 'polite' });
     const refreshBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', text: 'Refresh', onclick: () => refresh(true) });
     const toggleBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', onclick: () => setEnabled(!settings.enabled) });
     const settingsBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', text: 'Settings', onclick: openMoreWeather });
-    const root = el('div', { class: 'seq-ts-status', 'data-seq-ts': '' }, [
-      el('span', {}, [el('span', { class: 'seq-ts-status__swatch', 'aria-hidden': 'true' }), text]),
-      refreshBtn, toggleBtn, settingsBtn,
+    const root = el('div', { class: 'seq-ts-meta', 'data-seq-ts': '' }, [
+      text, el('span', { class: 'seq-ts-meta__actions' }, [refreshBtn, toggleBtn, settingsBtn]),
     ]);
 
     function update() {
+      const att = attachments.values().next().value;
       let msg;
       let warn = false;
-      if (!settings.enabled) msg = 'Thunderstorm tracker off';
-      else if (state.error && !state.bitmap) { msg = `Thunderstorm tracker unavailable (${state.error})`; warn = true; }
-      else if (!state.bitmap) msg = 'Thunderstorm tracker loading…';
+      if (!settings.enabled) msg = 'Thunderstorm tracker: hidden';
+      else if (state.error && !state.bitmap) { msg = `Thunderstorm tracker: unavailable (${state.error})`; warn = true; }
+      else if (!state.bitmap) msg = 'Thunderstorm tracker: loading…';
       else {
-        const parts = [];
+        msg = 'Thunderstorm tracker: ';
         if (state.issued) {
           const age = Date.now() - state.issued.getTime();
-          parts.push(`Thunderstorm tracker ${formatIssued(state.issued)} (${formatAge(age)})`);
-          if (age > STALE_MS) { parts.push('not recently updated'); warn = true; }
-        } else parts.push('Thunderstorm tracker');
-        if (att.inCoverage === false) parts.push('outside Southeast Queensland');
-        else if (att.frameHidden) parts.push('hidden for this earlier radar time');
-        else parts.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} storm cell${state.cells === 1 ? '' : 's'}`);
-        if (state.error) { parts.push('refresh failed'); warn = true; }
-        msg = parts.join(' · ');
+          msg += `${formatAgeLong(age)}, ${formatIssued(state.issued)}`;
+          if (age > STALE_MS) warn = true;
+        }
+        const extra = [];
+        if (att && att.inCoverage === false) extra.push('map is outside Southeast Queensland');
+        else extra.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} storm cell${state.cells === 1 ? '' : 's'}`);
+        if (settings.syncTimeline && frames.size > 1) extra.push(`${frames.size} images saved for the radar loop`);
+        if (state.error) { extra.push('refresh failed'); warn = true; }
+        msg += ` (${extra.join(', ')})`;
       }
       text.textContent = msg;
-      text.className = warn ? 'seq-ts-status__text--warn' : '';
+      text.className = warn ? 'seq-ts-meta__warn' : '';
       text.title = state.fetchedAt ? `Last checked ${formatIssued(state.fetchedAt)}` : '';
       toggleBtn.textContent = settings.enabled ? 'Hide' : 'Show';
       toggleBtn.setAttribute('aria-label', settings.enabled ? 'Hide thunderstorm tracker' : 'Show thunderstorm tracker');
       refreshBtn.hidden = !settings.enabled;
+      refreshBtn.setAttribute('aria-label', 'Refresh thunderstorm tracker');
+      settingsBtn.setAttribute('aria-label', 'Thunderstorm tracker settings');
     }
 
-    update();
     return { root, update };
+  }
+
+  const statusLine = buildStatusLine();
+
+  function placeStatus() {
+    ensureStyles();
+    const meta = document.querySelector('.C07_WeatherMetadata .metadata__container, .metadata__container');
+    if (meta) { meta.appendChild(statusLine.root); return; }
+    const att = attachments.values().next().value;
+    if (!att) return;
+    const anchor = (att.section && att.section.querySelector('.bom-scrub')) || att.container;
+    if (anchor.parentElement) anchor.insertAdjacentElement('afterend', statusLine.root);
   }
 
   // ----- "More weather" modal section -----------------------------------------
@@ -726,8 +844,8 @@
     ensureStyles();
 
     const show = makeCheckbox('seq-ts-enabled', 'Thunderstorm tracker', settings.enabled, (v) => setEnabled(v));
-    const latest = makeCheckbox('seq-ts-latest', 'Hide when paused on an earlier radar time', settings.onlyLatest, (v) => {
-      settings.onlyLatest = v; saveSettings(); updateAll(true);
+    const sync = makeCheckbox('seq-ts-sync', 'Match the radar timeline', settings.syncTimeline, (v) => {
+      settings.syncTimeline = v; saveSettings(); updateAll(true);
     });
     const area = makeCheckbox('seq-ts-area', 'Show tracker coverage area', settings.showFootprint, (v) => {
       settings.showFootprint = v; saveSettings(); updateAll(true);
@@ -745,6 +863,8 @@
         settings.intervalSec = +v; saveSettings(); schedule();
       });
 
+    const savedOut = el('span');
+    const clearBtn = tertiaryButton('Clear saved images', 'Clear saved thunderstorm tracker images', () => clearHistory());
     const STEP = 500; // metres
     const nudgeOut = el('span', { class: 'bom-typo bom-typo--s-caption' });
     const nudge = (dx, dy) => () => {
@@ -762,11 +882,18 @@
         nudgeOut,
       ]),
     ]);
+    const historyGroup = el('div', { class: 'seq-ts-group' }, [clearBtn]);
 
     const fieldset = el('fieldset', { class: 'seq-ts-fieldset', 'data-seq-ts': '' }, [
       el('legend', {}, [el('h3', { class: 'bom-typo bom-typo--s-heading-xs bom-typo--responsive', text: 'Thunderstorm tracker (SEQ pilot)' })]),
-      show.wrap, latest.wrap, area.wrap,
-      opacity.group, colour.group, interval.group, nudgeGroup,
+      show.wrap, sync.wrap,
+      el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive' }, [
+        'Shows the tracker image that goes with each radar time as you play or scrub the loop. BoM only ' +
+        'publishes the latest image, so earlier ones are saved in this browser while the page is open (last 2 hours). ',
+        savedOut,
+      ]),
+      area.wrap,
+      opacity.group, colour.group, interval.group, nudgeGroup, historyGroup,
       el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive' }, [
         'Estimated storm positions in 10, 20 and 30 minutes, from the ',
         el('a', { href: TRACKER_PAGE, target: '_blank', rel: 'noopener', text: 'Thunderstorm Tracker' }),
@@ -780,7 +907,8 @@
     modalUpdate = () => {
       if (!fieldset.isConnected) { modalUpdate = null; return; }
       show.input.checked = settings.enabled;
-      latest.input.checked = settings.onlyLatest;
+      sync.input.checked = settings.syncTimeline;
+      savedOut.textContent = `${frames.size} image${frames.size === 1 ? '' : 's'} saved.`;
       area.input.checked = settings.showFootprint;
       opacity.set(settings.opacity);
       colour.set(settings.colour);
@@ -794,8 +922,8 @@
   function updateAll(redraw) {
     for (const att of attachments.values()) {
       if (redraw) { att.last = ''; att.draw(); }
-      att.status.update();
     }
+    statusLine.update();
     if (modalUpdate) modalUpdate();
   }
 
@@ -819,12 +947,15 @@
       node.__seqTsView = view;
       if (attachments.has(view)) return;
       attachments.set(view, new Attachment(view));
+      placeStatus();
+      if (!historyLoaded) { historyLoaded = true; loadHistory(); }
       if (!state.bitmap && settings.enabled) refresh();
       schedule();
       updateAll(false);
     });
   }
 
+  let historyLoaded = false;
   let scanQueued = false;
   const mo = new MutationObserver(() => {
     if (attachments.size && document.querySelector('.more-weather')) enhanceModal();
@@ -849,5 +980,5 @@
   });
 
   // Small debug handle for troubleshooting from DevTools.
-  window.__seqThunderstormTracker = { core, settings, state, attachments, refresh };
+  window.__seqThunderstormTracker = { core, settings, state, attachments, frames, refresh };
 })();

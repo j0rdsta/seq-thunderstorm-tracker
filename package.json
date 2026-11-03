@@ -1,6 +1,6 @@
 {
   "name": "seq-thunderstorm-tracker",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Userscript that overlays the BoM Thunderstorm Tracker (SEQ pilot) on the bom.gov.au radar map.",
   "license": "MIT",
   "author": "j0rdsta",
