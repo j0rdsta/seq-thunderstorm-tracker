@@ -29,16 +29,24 @@ Updates install automatically through your userscript manager.
 - **Aligned overlay**: storm cells, movement arrows and forecast arcs are drawn on the radar map in the
   right place at every zoom level. The tracker's basemap (land, sea, borders, labels) is keyed out, so
   you still see the radar underneath.
-- **Auto-refresh** every 1 minute by default (configurable from 30 s to 10 min). It uses a cheap ETag
-  check, so the image is only downloaded when BoM publishes a new one, and it pauses while the tab is in
-  the background.
-- **Status chip** on the map: issue time and age (e.g. `2:40 pm (3 min ago)`), the number of tracked
-  cells or *no tracked storms*, a red **stale** warning if the tracker is more than 20 minutes old, and
-  *outside SEQ coverage* when you've panned away.
-- **Settings** (⚙): on/off switch (also **Shift+T**), opacity, refresh interval, colour (original orange,
-  high-contrast magenta, or black), a dashed **coverage box** showing the tracker's extent, and **alignment
-  nudge** buttons in 0.5 km steps. Settings are saved in your browser.
-- **↻** forces an immediate refresh.
+- **Status under the radar timeline**: a line in the same style as BoM's timeline label, e.g.
+  `Thunderstorm tracker 12:31pm AEST (2 min ago) · 17 storm cells   Refresh  Hide  Settings`.
+  It warns when the tracker hasn't updated for 20 minutes and says when you've panned outside Southeast
+  Queensland.
+- **Settings in BoM's own dialog**: open **More weather** (or click *Settings* in the status line). Under
+  *Map settings* there's a **Thunderstorm tracker (SEQ pilot)** section built from the site's own controls:
+  - Thunderstorm tracker on/off (also **Shift+T**)
+  - Hide when paused on an earlier radar time (on by default; the overlay stays visible while the loop plays)
+  - Show tracker coverage area (dashed outline)
+  - Overlay opacity: 50%, 85% or 100%
+  - Storm colour: orange, magenta or black
+  - Check for updates every 1, 2, 5 or 10 minutes
+  - Adjust alignment in 0.5 km steps, in case the overlay looks slightly off
+
+  Settings are saved in your browser.
+- **Auto-refresh** with a cheap HTTP revalidation, so the image is only downloaded when BoM publishes
+  a new one (typically every 5–10 minutes). There are never more than 2 requests a minute, and it pauses
+  while the tab is in the background.
 
 ## How it works
 

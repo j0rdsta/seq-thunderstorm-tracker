@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-11-03
+
+### Added
+- Settings now live in BoM's own **More weather** dialog, under *Map settings*, as a "Thunderstorm tracker (SEQ
+  pilot)" section built from the site's checkbox, radio and button styles.
+- A tracker status line under the radar timeline, in the same style as BoM's timeline label: issue time
+  and age, storm cell count, and *Refresh*, *Hide/Show* and *Settings* links.
+- Option to hide the overlay when the radar loop is paused on an earlier radar time. The tracker only
+  describes the present, so it shouldn't sit over old radar.
+
+### Changed
+- Removed the floating chip on the map. Its controls moved to the dialog and the status line.
+- Times are shown the way BoM shows them (e.g. `12:26pm AEST`).
+- Refresh interval options are now 1, 2, 5 and 10 minutes.
+
 ## [0.1.0] - 2026-11-03
 
 ### Added

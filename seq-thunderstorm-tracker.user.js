@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BoM SEQ Thunderstorm Tracker Overlay
 // @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
-// @version      0.1.0
+// @version      0.2.0
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
@@ -256,10 +256,41 @@
     return `${h} h ${mins % 60} min ago`;
   }
 
+  /** Format like BoM's own labels: "12:26pm AEST" (Queensland time, no daylight saving). */
   function formatIssued(date) {
-    return date.toLocaleTimeString('en-AU', {
-      timeZone: 'Australia/Brisbane', hour: 'numeric', minute: '2-digit',
+    const t = date.toLocaleTimeString('en-AU', {
+      timeZone: 'Australia/Brisbane', hour: 'numeric', minute: '2-digit', hour12: true,
     });
+    return `${t.replace(/\s+/g, '').toLowerCase()} AEST`;
+  }
+
+  const TZ_OFFSETS_MIN = { AEST: 600, AEDT: 660, ACST: 570, ACDT: 630, AWST: 480 };
+  const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+  /**
+   * Parse the radar timeline label, e.g. "Tuesday 3 Nov,  12:20pm AEST", into a Date.
+   * The year isn't shown, so pick the one that puts the date closest to `now`.
+   */
+  function parseTimelineLabel(text, now = new Date()) {
+    const m = /(\d{1,2})\s+([A-Za-z]{3})[a-z]*,?\s+(\d{1,2}):(\d{2})\s*(am|pm)\s+(AEST|AEDT|ACST|ACDT|AWST)/i.exec(text || '');
+    if (!m) return null;
+    const month = MONTHS.indexOf(m[2].toLowerCase());
+    if (month < 0) return null;
+    let hour = +m[3] % 12;
+    if (m[5].toLowerCase() === 'pm') hour += 12;
+    const offset = TZ_OFFSETS_MIN[m[6].toUpperCase()];
+    let best = null;
+    for (const y of [now.getUTCFullYear() - 1, now.getUTCFullYear(), now.getUTCFullYear() + 1]) {
+      const d = new Date(Date.UTC(y, month, +m[1], hour, +m[4]) - offset * 60000);
+      if (!best || Math.abs(d - now) < Math.abs(best - now)) best = d;
+    }
+    return best;
+  }
+
+  /** Does a radar frame time match the tracker issue time closely enough to overlay it? */
+  function frameMatchesTracker(frame, issued, toleranceMs = 15 * 60000) {
+    if (!frame || !issued) return true; // unknown → don't hide
+    return Math.abs(frame.getTime() - issued.getTime()) <= toleranceMs;
   }
 
   const core = {
@@ -267,6 +298,7 @@
     lonLatToMercator, imageToMercatorAffine, applyAffine, invertAffine, imageToScreenTransform,
     footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, isCellFill, countCells,
     looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatIssued,
+    parseTimelineLabel, frameMatchesTracker,
   };
 
   if (typeof module !== 'undefined' && module.exports) {
@@ -285,7 +317,7 @@
     intervalSec: 60,
     colour: 'original',
     showFootprint: false,
-    collapsed: true,
+    onlyLatest: true, // hide while the radar loop is paused on a past/forecast frame
     nudge: { dx: 0, dy: 0 },
   };
   const STALE_MS = 20 * 60 * 1000;
@@ -426,8 +458,10 @@
       if (surface && surface.parentElement) surface.parentElement.insertBefore(this.canvas, surface.nextSibling);
       else this.container.appendChild(this.canvas);
 
-      this.chip = buildChip(this);
-      this.container.appendChild(this.chip.root);
+      this.section = this.container.closest('.bom-spatial-map') || this.container.parentElement;
+      this.status = buildStatusLine(this);
+      this.placeStatus();
+      this.frameHidden = false;
 
       this.loop = this.loop.bind(this);
       this.raf = requestAnimationFrame(this.loop);
@@ -442,14 +476,33 @@
       if (!this.alive()) { this.destroy(); return; }
       const v = this.view;
       const c = v.center;
+      if (!this.status.root.isConnected) this.placeStatus();
       if (c) {
-        const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}`;
+        const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}|${this.timelineText()}|${this.timelinePlaying()}`;
         if (key !== this.last) {
           this.last = key;
           this.draw();
         }
       }
       this.raf = requestAnimationFrame(this.loop);
+    }
+
+    /** Put the status line directly under the radar timeline (or under the map as a fallback). */
+    placeStatus() {
+      const scrub = this.section && this.section.querySelector('.bom-scrub');
+      const anchor = scrub || this.container;
+      if (anchor.parentElement) anchor.insertAdjacentElement('afterend', this.status.root);
+    }
+
+    timelineText() {
+      const label = this.section && this.section.querySelector('.bom-scrub-display-label');
+      return label ? label.textContent : '';
+    }
+
+    /** BoM's play/pause button reads "Pause" while the radar loop is animating. */
+    timelinePlaying() {
+      const btn = this.section && this.section.querySelector('.bom-scrub-action__label');
+      return !!btn && /pause/i.test(btn.textContent);
     }
 
     draw() {
@@ -469,7 +522,12 @@
       ctx.clearRect(0, 0, cw, ch);
       // The center/resolution box is only exact for north-up views; don't cull rotated ones.
       this.inCoverage = !!e && (!!v.rotation || intersects(footprintBounds(geo()), e));
-      if (!settings.enabled || !e || !this.inCoverage) return;
+      this.frameTime = parseTimelineLabel(this.timelineText());
+      // While the loop plays, keep the overlay steady rather than blinking on the newest frame only.
+      this.frameHidden = settings.onlyLatest && !this.timelinePlaying() && !!state.issued &&
+        !frameMatchesTracker(this.frameTime, state.issued);
+      this.status.update();
+      if (!settings.enabled || !e || !this.inCoverage || this.frameHidden) return;
       if (e.spatialReference && e.spatialReference.wkid && ![102100, 3857, 900913].includes(e.spatialReference.wkid)) return;
 
       const g = geo();
@@ -513,38 +571,29 @@
     destroy() {
       cancelAnimationFrame(this.raf);
       this.canvas.remove();
-      this.chip.root.remove();
+      this.status.root.remove();
       attachments.delete(this.view);
       schedule();
     }
   }
 
-  // ----- UI chip --------------------------------------------------------------
+  // ----- UI (reuses bom.gov.au markup and classes) ---------------------------
 
   const CSS = `
-  .seq-ts-chip{position:absolute;left:8px;bottom:28px;z-index:5;max-width:min(320px,calc(100% - 16px));
-    font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1d1d1f;
-    background:rgba(255,255,255,.94);border:1px solid rgba(0,0,0,.15);border-radius:8px;
-    box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:auto;user-select:none}
-  .seq-ts-chip *{box-sizing:border-box}
-  .seq-ts-row{display:flex;align-items:center;gap:6px;padding:5px 6px 5px 8px}
-  .seq-ts-title{font-weight:600;white-space:nowrap}
-  .seq-ts-status{color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
-  .seq-ts-status.stale,.seq-ts-status.err{color:#b3261e}
-  .seq-ts-btn{all:unset;cursor:pointer;padding:2px 6px;border-radius:5px;line-height:1.2}
-  .seq-ts-btn:hover{background:rgba(0,0,0,.07)}
-  .seq-ts-btn:focus-visible{outline:2px solid #0b57d0}
-  .seq-ts-switch{width:30px;height:16px;border-radius:8px;background:#bbb;position:relative;flex:none}
-  .seq-ts-switch::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s}
-  .seq-ts-switch[aria-checked=true]{background:#cc7833}
-  .seq-ts-switch[aria-checked=true]::after{left:16px}
-  .seq-ts-panel{border-top:1px solid rgba(0,0,0,.1);padding:6px 8px 8px;display:grid;grid-template-columns:auto 1fr;gap:5px 8px;align-items:center}
-  .seq-ts-panel[hidden]{display:none}
-  .seq-ts-panel label{color:#444}
-  .seq-ts-panel select,.seq-ts-panel input[type=range]{width:100%;font:inherit}
-  .seq-ts-panel a{color:#0b57d0}
-  .seq-ts-full{grid-column:1/-1}
-  .seq-ts-nudge{display:flex;gap:2px;align-items:center}
+  .seq-ts-status{display:flex;flex-wrap:wrap;justify-content:flex-end;align-items:center;gap:2px 12px;
+    padding:6px 0 0;font-family:Inter,Inter-fallback,sans-serif;font-size:12px;line-height:16px;color:#4a4a4a}
+  .seq-ts-status__swatch{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px;
+    vertical-align:-1px;background:#f5bd8a;box-shadow:inset 0 0 0 1.5px #cc7833}
+  .seq-ts-status__text--warn{color:#b3261e}
+  .seq-ts-linkbtn{all:unset;cursor:pointer;text-decoration:underline;text-underline-offset:2px;color:inherit}
+  .seq-ts-linkbtn:hover{text-decoration-thickness:2px}
+  .seq-ts-linkbtn:focus-visible{outline:2px solid currentColor;outline-offset:2px;border-radius:2px}
+  .seq-ts-fieldset{margin-top:24px}
+  .seq-ts-group{margin:12px 0 0}
+  .seq-ts-group__label{margin:0 0 4px}
+  .seq-ts-radios{display:flex;flex-wrap:wrap;gap:0 20px}
+  .seq-ts-nudge{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+  .seq-ts-fieldset .overlay-description a{color:inherit}
   `;
 
   function ensureStyles() {
@@ -558,119 +607,196 @@
   function el(tag, attrs = {}, children = []) {
     const n = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs)) {
+      if (v === undefined || v === null || v === false) continue;
       if (k === 'text') n.textContent = v;
       else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
-      else n.setAttribute(k, v);
+      else n.setAttribute(k, v === true ? '' : v);
     }
-    children.forEach((c) => c && n.appendChild(c));
+    children.forEach((c) => c && n.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
     return n;
   }
 
-  function buildChip(att) {
+  function openMoreWeather() {
+    const btn = document.getElementById('bom-tab-more-weather') || document.querySelector('[data-testid="more-weather"]');
+    if (btn) btn.click();
+  }
+
+  /** Status line under the radar timeline, styled like BoM's timeline label. */
+  function buildStatusLine(att) {
     ensureStyles();
-    const sw = el('button', { class: 'seq-ts-btn seq-ts-switch', role: 'switch', 'aria-label': 'Show thunderstorm tracker overlay (Shift+T)', title: 'Show thunderstorm tracker (Shift+T)' });
-    const status = el('span', { class: 'seq-ts-status', 'aria-live': 'polite' });
-    const refreshBtn = el('button', { class: 'seq-ts-btn', title: 'Refresh now', 'aria-label': 'Refresh tracker now', text: '↻' });
-    const gear = el('button', { class: 'seq-ts-btn', title: 'Tracker settings', 'aria-label': 'Tracker settings', 'aria-expanded': 'false', text: '⚙' });
-
-    const opacity = el('input', { type: 'range', min: '0.2', max: '1', step: '0.05', 'aria-label': 'Overlay opacity' });
-    const interval = el('select', { 'aria-label': 'Refresh interval' });
-    [[30, '30 s'], [60, '1 min'], [120, '2 min'], [300, '5 min'], [600, '10 min']].forEach(([v, t]) =>
-      interval.appendChild(el('option', { value: String(v), text: t })));
-    const colour = el('select', { 'aria-label': 'Overlay colour' });
-    [['original', 'Original orange'], ['magenta', 'High-contrast magenta'], ['black', 'Black']].forEach(([v, t]) =>
-      colour.appendChild(el('option', { value: v, text: t })));
-    const footprint = el('input', { type: 'checkbox', 'aria-label': 'Show coverage box' });
-    const nudgeOut = el('span', { style: 'color:#666;margin-left:4px' });
-    const nudgeBtn = (label, dx, dy) => el('button', {
-      class: 'seq-ts-btn', text: label, title: `Nudge overlay ${label}`,
-      onclick: () => {
-        if (dx === null) settings.nudge = { dx: 0, dy: 0 };
-        else settings.nudge = { dx: settings.nudge.dx + dx, dy: settings.nudge.dy + dy };
-        saveSettings();
-        updateAll(true);
-      },
-    });
-    const STEP = 500; // metres
-    const panel = el('div', { class: 'seq-ts-panel', hidden: '' }, [
-      el('label', { text: 'Opacity' }), opacity,
-      el('label', { text: 'Refresh' }), interval,
-      el('label', { text: 'Colour' }), colour,
-      el('label', { text: 'Coverage box' }), el('label', {}, [footprint]),
-      el('label', { text: 'Align' }), el('span', { class: 'seq-ts-nudge' }, [
-        nudgeBtn('←', -STEP, 0), nudgeBtn('→', STEP, 0), nudgeBtn('↑', 0, STEP), nudgeBtn('↓', 0, -STEP),
-        nudgeBtn('reset', null, null), nudgeOut,
-      ]),
-      el('div', { class: 'seq-ts-full' }, [
-        el('a', { href: TRACKER_PAGE, target: '_blank', rel: 'noopener', text: 'Official Thunderstorm Tracker (SEQ pilot) ↗' }),
-      ]),
-      el('div', { class: 'seq-ts-full', style: 'color:#666', text: 'Cells show estimated positions at +10, +20 and +30 min. Not affiliated with BoM.' }),
+    const text = el('span', { 'aria-live': 'polite' });
+    const refreshBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', text: 'Refresh', onclick: () => refresh(true) });
+    const toggleBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', onclick: () => setEnabled(!settings.enabled) });
+    const settingsBtn = el('button', { type: 'button', class: 'seq-ts-linkbtn', text: 'Settings', onclick: openMoreWeather });
+    const root = el('div', { class: 'seq-ts-status', 'data-seq-ts': '' }, [
+      el('span', {}, [el('span', { class: 'seq-ts-status__swatch', 'aria-hidden': 'true' }), text]),
+      refreshBtn, toggleBtn, settingsBtn,
     ]);
-    const root = el('div', { class: 'seq-ts-chip' }, [
-      el('div', { class: 'seq-ts-row' }, [sw, el('span', { class: 'seq-ts-title', text: '⛈ Storm tracker' }), status, refreshBtn, gear]),
-      panel,
-    ]);
-
-    // Keep map from panning/zooming when interacting with the chip.
-    ['pointerdown', 'mousedown', 'wheel', 'dblclick', 'touchstart', 'keydown', 'click'].forEach((t) =>
-      root.addEventListener(t, (ev) => ev.stopPropagation()));
-
-    sw.addEventListener('click', () => setEnabled(!settings.enabled));
-    refreshBtn.addEventListener('click', () => refresh(true));
-    gear.addEventListener('click', () => {
-      settings.collapsed = !settings.collapsed;
-      saveSettings();
-      updateAll(false);
-    });
-    opacity.addEventListener('input', () => { settings.opacity = +opacity.value; saveSettings(); updateAll(true); });
-    interval.addEventListener('change', () => { settings.intervalSec = +interval.value; saveSettings(); schedule(); });
-    colour.addEventListener('change', () => { settings.colour = colour.value; saveSettings(); rekey(); updateAll(true); });
-    footprint.addEventListener('change', () => { settings.showFootprint = footprint.checked; saveSettings(); updateAll(true); });
 
     function update() {
-      sw.setAttribute('aria-checked', String(settings.enabled));
-      panel.hidden = settings.collapsed;
-      gear.setAttribute('aria-expanded', String(!settings.collapsed));
-      opacity.value = String(settings.opacity);
-      interval.value = String(settings.intervalSec);
-      colour.value = settings.colour;
-      footprint.checked = settings.showFootprint;
-      const { dx, dy } = settings.nudge;
-      nudgeOut.textContent = dx || dy ? `${(dx / 1000).toFixed(1)}, ${(dy / 1000).toFixed(1)} km` : '';
-
-      let text = '';
-      let cls = '';
-      if (!settings.enabled) text = 'off';
-      else if (state.error && !state.bitmap) { text = `unavailable (${state.error})`; cls = 'err'; }
-      else if (!state.bitmap) text = 'loading…';
-      else if (att.inCoverage === false) text = 'outside SEQ coverage';
+      let msg;
+      let warn = false;
+      if (!settings.enabled) msg = 'Thunderstorm tracker off';
+      else if (state.error && !state.bitmap) { msg = `Thunderstorm tracker unavailable (${state.error})`; warn = true; }
+      else if (!state.bitmap) msg = 'Thunderstorm tracker loading…';
       else {
         const parts = [];
         if (state.issued) {
           const age = Date.now() - state.issued.getTime();
-          parts.push(`${formatIssued(state.issued)} (${formatAge(age)})`);
-          if (age > STALE_MS) cls = 'stale';
-        }
-        parts.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} cell${state.cells === 1 ? '' : 's'}`);
-        if (state.error) { parts.push('⚠ refresh failed'); cls = 'err'; }
-        text = parts.join(' · ');
+          parts.push(`Thunderstorm tracker ${formatIssued(state.issued)} (${formatAge(age)})`);
+          if (age > STALE_MS) { parts.push('not recently updated'); warn = true; }
+        } else parts.push('Thunderstorm tracker');
+        if (att.inCoverage === false) parts.push('outside Southeast Queensland');
+        else if (att.frameHidden) parts.push('hidden for this earlier radar time');
+        else parts.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} storm cell${state.cells === 1 ? '' : 's'}`);
+        if (state.error) { parts.push('refresh failed'); warn = true; }
+        msg = parts.join(' · ');
       }
-      status.textContent = text;
-      status.className = `seq-ts-status ${cls}`;
-      status.title = state.issued
-        ? `Issued ${state.issued.toLocaleString('en-AU', { timeZone: 'Australia/Brisbane' })} AEST` +
-          (state.fetchedAt ? `\nLast checked ${state.fetchedAt.toLocaleTimeString('en-AU')}` : '')
-        : text;
+      text.textContent = msg;
+      text.className = warn ? 'seq-ts-status__text--warn' : '';
+      text.title = state.fetchedAt ? `Last checked ${formatIssued(state.fetchedAt)}` : '';
+      toggleBtn.textContent = settings.enabled ? 'Hide' : 'Show';
+      toggleBtn.setAttribute('aria-label', settings.enabled ? 'Hide thunderstorm tracker' : 'Show thunderstorm tracker');
+      refreshBtn.hidden = !settings.enabled;
     }
 
+    update();
     return { root, update };
+  }
+
+  // ----- "More weather" modal section -----------------------------------------
+
+  let modalUpdate = null;
+
+  /** Clone one of BoM's own checkboxes so icons and styling match exactly. */
+  function makeCheckbox(id, label, checked, onChange) {
+    const tpl = document.querySelector('.more-weather .bom-form-checkbox');
+    let wrap;
+    if (tpl) {
+      wrap = tpl.cloneNode(true);
+      wrap.querySelectorAll('[id],[for],[data-testid]').forEach((n) => {
+        n.removeAttribute('data-testid');
+      });
+    } else {
+      wrap = el('div', { class: 'bom-form-checkbox show-checkbox' }, [
+        el('input', { class: 'bom-form-checkbox__input', type: 'checkbox' }),
+        el('label', { class: 'bom-form-checkbox__label' }, [el('span', { class: 'bom-form-checkbox__label-text' })]),
+      ]);
+    }
+    const input = wrap.querySelector('input');
+    const lab = wrap.querySelector('label');
+    input.id = id;
+    input.removeAttribute('name');
+    input.removeAttribute('data-value');
+    input.checked = checked;
+    lab.setAttribute('for', id);
+    const t = wrap.querySelector('.bom-form-checkbox__label-text') || lab;
+    t.textContent = label;
+    input.addEventListener('change', () => onChange(input.checked));
+    return { wrap, input };
+  }
+
+  function makeRadioGroup(name, label, options, current, onChange) {
+    const inputs = [];
+    const radios = el('div', { class: 'seq-ts-radios', role: 'radiogroup', 'aria-label': label },
+      options.map(([value, text]) => {
+        const input = el('input', { type: 'radio', name, value: String(value) });
+        input.checked = String(value) === String(current);
+        input.addEventListener('change', () => input.checked && onChange(value));
+        inputs.push(input);
+        return el('label', { class: 'bom-form-radio' }, [input, text]);
+      }));
+    const group = el('div', { class: 'seq-ts-group' }, [
+      el('p', { class: 'seq-ts-group__label bom-typo bom-typo--s-caption bom-typo--responsive', text: label }),
+      radios,
+    ]);
+    return { group, set: (v) => inputs.forEach((i) => { i.checked = i.value === String(v); }) };
+  }
+
+  function tertiaryButton(text, aria, onclick) {
+    return el('button', { type: 'button', class: 'bom-button bom-button--tertiary bom-button--condensed', 'aria-label': aria, onclick }, [
+      el('span', { class: 'bom-button__label', text }),
+    ]);
+  }
+
+  function enhanceModal() {
+    const host = document.querySelector('.more-weather .more-weather__overlays') ||
+      document.querySelector('.more-weather .more-weather__right-panel__inner');
+    if (!host || host.querySelector('.seq-ts-fieldset')) return;
+    ensureStyles();
+
+    const show = makeCheckbox('seq-ts-enabled', 'Thunderstorm tracker', settings.enabled, (v) => setEnabled(v));
+    const latest = makeCheckbox('seq-ts-latest', 'Hide when paused on an earlier radar time', settings.onlyLatest, (v) => {
+      settings.onlyLatest = v; saveSettings(); updateAll(true);
+    });
+    const area = makeCheckbox('seq-ts-area', 'Show tracker coverage area', settings.showFootprint, (v) => {
+      settings.showFootprint = v; saveSettings(); updateAll(true);
+    });
+    const opacity = makeRadioGroup('seq-ts-opacity', 'Overlay opacity',
+      [[0.5, '50%'], [0.85, '85%'], [1, '100%']], settings.opacity, (v) => {
+        settings.opacity = +v; saveSettings(); updateAll(true);
+      });
+    const colour = makeRadioGroup('seq-ts-colour', 'Storm colour',
+      [['original', 'Orange'], ['magenta', 'Magenta'], ['black', 'Black']], settings.colour, (v) => {
+        settings.colour = v; saveSettings(); rekey(); updateAll(true);
+      });
+    const interval = makeRadioGroup('seq-ts-interval', 'Check for updates every',
+      [[60, '1 min'], [120, '2 min'], [300, '5 min'], [600, '10 min']], settings.intervalSec, (v) => {
+        settings.intervalSec = +v; saveSettings(); schedule();
+      });
+
+    const STEP = 500; // metres
+    const nudgeOut = el('span', { class: 'bom-typo bom-typo--s-caption' });
+    const nudge = (dx, dy) => () => {
+      settings.nudge = dx === null ? { dx: 0, dy: 0 } : { dx: settings.nudge.dx + dx, dy: settings.nudge.dy + dy };
+      saveSettings(); updateAll(true);
+    };
+    const nudgeGroup = el('div', { class: 'seq-ts-group' }, [
+      el('p', { class: 'seq-ts-group__label bom-typo bom-typo--s-caption bom-typo--responsive', text: 'Adjust alignment (0.5 km steps)' }),
+      el('div', { class: 'seq-ts-nudge' }, [
+        tertiaryButton('←', 'Move overlay west', nudge(-STEP, 0)),
+        tertiaryButton('→', 'Move overlay east', nudge(STEP, 0)),
+        tertiaryButton('↑', 'Move overlay north', nudge(0, STEP)),
+        tertiaryButton('↓', 'Move overlay south', nudge(0, -STEP)),
+        tertiaryButton('Reset', 'Reset overlay alignment', nudge(null, null)),
+        nudgeOut,
+      ]),
+    ]);
+
+    const fieldset = el('fieldset', { class: 'seq-ts-fieldset', 'data-seq-ts': '' }, [
+      el('legend', {}, [el('h3', { class: 'bom-typo bom-typo--s-heading-xs bom-typo--responsive', text: 'Thunderstorm tracker (SEQ pilot)' })]),
+      show.wrap, latest.wrap, area.wrap,
+      opacity.group, colour.group, interval.group, nudgeGroup,
+      el('div', { class: 'overlay-description bom-typo bom-typo--s-caption bom-typo--responsive' }, [
+        'Estimated storm positions in 10, 20 and 30 minutes, from the ',
+        el('a', { href: TRACKER_PAGE, target: '_blank', rel: 'noopener', text: 'Thunderstorm Tracker' }),
+        '. Southeast Queensland only. Added by an unofficial browser script, not the Bureau.',
+      ]),
+    ]);
+    // Keep the host React app from seeing events on nodes it doesn't own.
+    ['click', 'change', 'input'].forEach((t) => fieldset.addEventListener(t, (ev) => ev.stopPropagation()));
+    host.appendChild(fieldset);
+
+    modalUpdate = () => {
+      if (!fieldset.isConnected) { modalUpdate = null; return; }
+      show.input.checked = settings.enabled;
+      latest.input.checked = settings.onlyLatest;
+      area.input.checked = settings.showFootprint;
+      opacity.set(settings.opacity);
+      colour.set(settings.colour);
+      interval.set(settings.intervalSec);
+      const { dx, dy } = settings.nudge;
+      nudgeOut.textContent = dx || dy ? `${(dx / 1000).toFixed(1)} km E, ${(dy / 1000).toFixed(1)} km N` : '';
+    };
+    modalUpdate();
   }
 
   function updateAll(redraw) {
     for (const att of attachments.values()) {
       if (redraw) { att.last = ''; att.draw(); }
-      att.chip.update();
+      att.status.update();
     }
+    if (modalUpdate) modalUpdate();
   }
 
   function setEnabled(on) {
@@ -701,6 +827,7 @@
 
   let scanQueued = false;
   const mo = new MutationObserver(() => {
+    if (attachments.size && document.querySelector('.more-weather')) enhanceModal();
     if (scanQueued) return;
     scanQueued = true;
     setTimeout(() => { scanQueued = false; scan(); }, 250);

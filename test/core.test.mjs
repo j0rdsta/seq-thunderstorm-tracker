@@ -131,3 +131,27 @@ test('userscript header is consistent with package.json', () => {
   assert.deepEqual(meta('updateURL'), [raw]);
   assert.deepEqual(meta('downloadURL'), [raw]);
 });
+
+test('formatIssued matches BoM style in Queensland time', () => {
+  assert.equal(core.formatIssued(new Date('2026-11-03T02:26:40Z')), '12:26pm AEST');
+  assert.equal(core.formatIssued(new Date('2026-11-02T21:05:00Z')), '7:05am AEST');
+});
+
+test('parseTimelineLabel reads the radar timeline label', () => {
+  const now = new Date('2026-11-03T02:30:00Z');
+  assert.equal(core.parseTimelineLabel('Tuesday 3 Nov,  12:20pm AEST', now).toISOString(), '2026-11-03T02:20:00.000Z');
+  assert.equal(core.parseTimelineLabel('Tuesday 3 Nov, 9:05am AEDT', now).toISOString(), '2026-11-02T22:05:00.000Z');
+  assert.equal(core.parseTimelineLabel('Wednesday 4 Nov', now), null);
+  assert.equal(core.parseTimelineLabel('', now), null);
+  // Year rollover: a 31 Dec label viewed on 1 Jan belongs to the previous year.
+  const jan = new Date('2027-01-01T00:10:00Z');
+  assert.equal(core.parseTimelineLabel('Thursday 31 Dec, 11:55pm AEST', jan).getUTCFullYear(), 2026);
+});
+
+test('frameMatchesTracker hides the overlay for old or forecast radar frames', () => {
+  const issued = new Date('2026-11-03T02:26:00Z');
+  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T02:20:00Z'), issued), true);
+  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T01:40:00Z'), issued), false);
+  assert.equal(core.frameMatchesTracker(new Date('2026-11-03T05:00:00Z'), issued), false);
+  assert.equal(core.frameMatchesTracker(null, issued), true);
+});
