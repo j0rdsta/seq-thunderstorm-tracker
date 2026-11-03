@@ -1,0 +1,726 @@
+// ==UserScript==
+// @name         BoM SEQ Thunderstorm Tracker Overlay
+// @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @version      0.1.0
+// @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
+// @author       j0rdsta
+// @license      MIT
+// @match        https://www.bom.gov.au/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// @homepageURL  https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @supportURL   https://github.com/j0rdsta/seq-thunderstorm-tracker/issues
+// @updateURL    https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker.user.js
+// @downloadURL  https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker.user.js
+// ==/UserScript==
+
+/* Not affiliated with or endorsed by the Bureau of Meteorology.
+ * Tracker imagery © Commonwealth of Australia, Bureau of Meteorology; it is fetched live by your browser. */
+
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------------
+  // Pure helpers (exported for Node tests)
+  // ---------------------------------------------------------------------------
+
+  const IMAGE_URL = 'https://www.bom.gov.au/fwo/IDA00050.png';
+  const TRACKER_PAGE = 'https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml';
+  const IMAGE_W = 600;
+  const IMAGE_H = 643;
+
+  /**
+   * Georeference of IDA00050.png in Web Mercator (EPSG:3857) metres.
+   * Derived by least-squares affine fit of 13 town markers on the image
+   * (see README "How the overlay is aligned"). Corner = image pixel corner.
+   */
+  const CORNERS = {
+    tl: [16852901.89, -3018857.35], // pixel (0, 0)
+    tr: [17134364.43, -3020336.98], // pixel (IMAGE_W, 0)
+    bl: [16852265.34, -3301850.42], // pixel (0, IMAGE_H)
+  };
+
+  const R = 6378137;
+  function lonLatToMercator(lon, lat) {
+    return [
+      (lon * Math.PI / 180) * R,
+      Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * R,
+    ];
+  }
+
+  /** Affine image-pixel -> mercator: X = a*px + c*py + e ; Y = b*px + d*py + f */
+  function imageToMercatorAffine(corners = CORNERS, w = IMAGE_W, h = IMAGE_H, nudge = { dx: 0, dy: 0 }) {
+    const [tlx, tly] = corners.tl;
+    return {
+      a: (corners.tr[0] - tlx) / w,
+      b: (corners.tr[1] - tly) / w,
+      c: (corners.bl[0] - tlx) / h,
+      d: (corners.bl[1] - tly) / h,
+      e: tlx + (nudge.dx || 0),
+      f: tly + (nudge.dy || 0),
+    };
+  }
+
+  function applyAffine(m, x, y) {
+    return [m.a * x + m.c * y + m.e, m.b * x + m.d * y + m.f];
+  }
+
+  /** Inverse of an affine (mercator -> image pixel). */
+  function invertAffine(m) {
+    const det = m.a * m.d - m.b * m.c;
+    return {
+      a: m.d / det,
+      b: -m.b / det,
+      c: -m.c / det,
+      d: m.a / det,
+      e: (m.c * m.f - m.d * m.e) / det,
+      f: (m.b * m.e - m.a * m.f) / det,
+    };
+  }
+
+  /**
+   * Compose image-px -> screen-px given a north-up view extent (mercator) and size in CSS px.
+   * Returns params for CanvasRenderingContext2D.setTransform(a, b, c, d, e, f).
+   */
+  function imageToScreenTransform(g, extent, width, height) {
+    const sx = width / (extent.xmax - extent.xmin);
+    const sy = height / (extent.ymax - extent.ymin);
+    return {
+      a: g.a * sx,
+      b: -g.b * sy,
+      c: g.c * sx,
+      d: -g.d * sy,
+      e: (g.e - extent.xmin) * sx,
+      f: (extent.ymax - g.f) * sy,
+    };
+  }
+
+  /** Mercator bounding box of the image footprint. */
+  function footprintBounds(g, w = IMAGE_W, h = IMAGE_H) {
+    const pts = [[0, 0], [w, 0], [0, h], [w, h]].map(([x, y]) => applyAffine(g, x, y));
+    const xs = pts.map((p) => p[0]);
+    const ys = pts.map((p) => p[1]);
+    return { xmin: Math.min(...xs), xmax: Math.max(...xs), ymin: Math.min(...ys), ymax: Math.max(...ys) };
+  }
+
+  function intersects(a, b) {
+    return a.xmin < b.xmax && a.xmax > b.xmin && a.ymin < b.ymax && a.ymax > b.ymin;
+  }
+
+  function rgbToHs(r, g, b) {
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const delta = max - min;
+    const s = max === 0 ? 0 : delta / max;
+    let h = 0;
+    if (delta !== 0) {
+      if (max === r) h = 60 * (((g - b) / delta) % 6);
+      else if (max === g) h = 60 * ((b - r) / delta + 2);
+      else h = 60 * ((r - g) / delta + 4);
+    }
+    if (h < 0) h += 360;
+    return [h, s];
+  }
+
+  /**
+   * Storm-feature alpha (0..1) for a tracker pixel. The tracker draws storms in orange
+   * (fill ≈ 245,189,138; lines ≈ 204,120,51) on a desaturated tan/blue basemap, so we key on
+   * orange hue + saturation. Fill ends up semi-transparent, lines opaque.
+   */
+  function stormAlpha(r, g, b) {
+    const [h, s] = rgbToHs(r, g, b);
+    if (h < 8 || h > 42) return 0;
+    if (s < 0.2) return 0;
+    if (r < 120) return 0;
+    return Math.min(1, (s - 0.2) / 0.4);
+  }
+
+  const COLOUR_MODES = {
+    original: null,
+    magenta: [214, 0, 170],
+    black: [20, 20, 20],
+  };
+
+  /** Chroma-key RGBA pixel buffer in place. Returns number of storm pixels. */
+  function chromaKey(data, mode = 'original') {
+    const tint = COLOUR_MODES[mode] || null;
+    let kept = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3] === 0 ? 0 : stormAlpha(data[i], data[i + 1], data[i + 2]);
+      if (a === 0) {
+        data[i + 3] = 0;
+        continue;
+      }
+      kept++;
+      if (tint) {
+        data[i] = tint[0];
+        data[i + 1] = tint[1];
+        data[i + 2] = tint[2];
+      }
+      data[i + 3] = Math.round(a * 255);
+    }
+    return kept;
+  }
+
+  /** Is this pixel part of a storm cell's filled ellipse (current position)? */
+  function isCellFill(r, g, b) {
+    const [h, s] = rgbToHs(r, g, b);
+    return h >= 18 && h <= 38 && s >= 0.3 && s <= 0.55 && r >= 200;
+  }
+
+  /** Count filled storm cells (connected components above minPixels). Operates on the ORIGINAL pixels. */
+  function countCells(data, w, h, minPixels = 40) {
+    const mask = new Uint8Array(w * h);
+    for (let i = 0, p = 0; p < w * h; i += 4, p++) {
+      if (data[i + 3] && isCellFill(data[i], data[i + 1], data[i + 2])) mask[p] = 1;
+    }
+    let count = 0;
+    const stack = [];
+    for (let p = 0; p < w * h; p++) {
+      if (mask[p] !== 1) continue;
+      mask[p] = 2;
+      stack.push(p);
+      let size = 0;
+      while (stack.length) {
+        const q = stack.pop();
+        size++;
+        const x = q % w;
+        const y = (q - x) / w;
+        if (x > 0 && mask[q - 1] === 1) { mask[q - 1] = 2; stack.push(q - 1); }
+        if (x < w - 1 && mask[q + 1] === 1) { mask[q + 1] = 2; stack.push(q + 1); }
+        if (y > 0 && mask[q - w] === 1) { mask[q - w] = 2; stack.push(q - w); }
+        if (y < h - 1 && mask[q + w] === 1) { mask[q + w] = 2; stack.push(q + w); }
+      }
+      if (size >= minPixels) count++;
+    }
+    return count;
+  }
+
+  /** Duck-type check for an ArcGIS JS 4.x MapView. */
+  function looksLikeMapView(v) {
+    try {
+      return !!v && typeof v === 'object' && !!v.extent && typeof v.zoom === 'number' &&
+        typeof v.toScreen === 'function' && 'container' in v;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** Walk React fibers upward from a DOM element looking for a MapView in hooks/props. */
+  function findMapViewFromElement(el, maxDomDepth = 12, maxFiberDepth = 80) {
+    for (let d = 0; el && d < maxDomDepth; d++, el = el.parentElement) {
+      const key = Object.keys(el).find((k) => k.startsWith('__reactFiber'));
+      if (!key) continue;
+      let fiber = el[key];
+      for (let i = 0; fiber && i < maxFiberDepth; i++, fiber = fiber.return) {
+        let hook = fiber.memoizedState;
+        for (let j = 0; hook && typeof hook === 'object' && j < 60; j++, hook = hook.next) {
+          const ms = hook.memoizedState;
+          if (looksLikeMapView(ms)) return ms;
+          if (ms && typeof ms === 'object' && looksLikeMapView(ms.current)) return ms.current;
+        }
+        const props = fiber.memoizedProps;
+        if (props && typeof props === 'object') {
+          for (const k in props) if (looksLikeMapView(props[k])) return props[k];
+        }
+        if (fiber.stateNode && looksLikeMapView(fiber.stateNode.view)) return fiber.stateNode.view;
+      }
+      return null; // only need the nearest React-managed ancestor
+    }
+    return null;
+  }
+
+  /**
+   * Current north-up extent of a MapView, derived from center + resolution + size.
+   * (view.extent can lag behind the rendered state, e.g. in background tabs; center/resolution
+   * are what toScreen()/toMap() use.) Falls back to view.extent.
+   */
+  function viewExtent(view, width, height) {
+    const c = view.center;
+    const res = view.resolution;
+    if (c && typeof c.x === 'number' && typeof res === 'number' && res > 0 && width && height) {
+      const hw = (width / 2) * res;
+      const hh = (height / 2) * res;
+      return { xmin: c.x - hw, xmax: c.x + hw, ymin: c.y - hh, ymax: c.y + hh, spatialReference: c.spatialReference };
+    }
+    const e = view.extent;
+    return e ? { xmin: e.xmin, xmax: e.xmax, ymin: e.ymin, ymax: e.ymax, spatialReference: e.spatialReference } : null;
+  }
+
+  function formatAge(ms) {
+    const mins = Math.round(ms / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    const h = Math.floor(mins / 60);
+    return `${h} h ${mins % 60} min ago`;
+  }
+
+  function formatIssued(date) {
+    return date.toLocaleTimeString('en-AU', {
+      timeZone: 'Australia/Brisbane', hour: 'numeric', minute: '2-digit',
+    });
+  }
+
+  const core = {
+    IMAGE_URL, TRACKER_PAGE, IMAGE_W, IMAGE_H, CORNERS,
+    lonLatToMercator, imageToMercatorAffine, applyAffine, invertAffine, imageToScreenTransform,
+    footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, isCellFill, countCells,
+    looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatIssued,
+  };
+
+  if (typeof module !== 'undefined' && module.exports) {
+    module.exports = core;
+    return;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Browser runtime
+  // ---------------------------------------------------------------------------
+
+  const STORE_KEY = 'seqThunderstormTracker.v1';
+  const DEFAULTS = {
+    enabled: true,
+    opacity: 0.85,
+    intervalSec: 60,
+    colour: 'original',
+    showFootprint: false,
+    collapsed: true,
+    nudge: { dx: 0, dy: 0 },
+  };
+  const STALE_MS = 20 * 60 * 1000;
+  const MIN_REQUEST_GAP_MS = 30 * 1000;
+  const FETCH_TIMEOUT_MS = 20 * 1000;
+
+  const settings = loadSettings();
+  function loadSettings() {
+    try {
+      return { ...DEFAULTS, ...JSON.parse(localStorage.getItem(STORE_KEY) || '{}') };
+    } catch (_) {
+      return { ...DEFAULTS };
+    }
+  }
+  function saveSettings() {
+    try { localStorage.setItem(STORE_KEY, JSON.stringify(settings)); } catch (_) { /* ignore */ }
+  }
+
+  const state = {
+    bitmap: null, // keyed canvas
+    rawData: null, // ImageData of original image (for re-keying on colour change)
+    etag: null,
+    issued: null,
+    cells: null,
+    fetchedAt: null,
+    error: null,
+    timer: null,
+    inflight: false,
+    lastRequestAt: 0,
+    badSize: null,
+  };
+
+  /** @type {Map<object, Attachment>} */
+  const attachments = new Map();
+
+  function geo() {
+    return imageToMercatorAffine(CORNERS, IMAGE_W, IMAGE_H, settings.nudge);
+  }
+
+  // ----- fetching -----------------------------------------------------------
+
+  /**
+   * Fetch the tracker image if it changed. Uses the stable URL with HTTP revalidation
+   * (cache: 'no-cache' → conditional request, 304 from BoM's CDN when unchanged).
+   * Automatic refreshes are rate-limited to one request per MIN_REQUEST_GAP_MS;
+   * a manual refresh (manual = true) bypasses the gap but not an in-flight request.
+   */
+  async function refresh(manual = false) {
+    if (state.inflight) return;
+    if (!manual && state.lastRequestAt && Date.now() - state.lastRequestAt < MIN_REQUEST_GAP_MS) return;
+    state.inflight = true;
+    state.lastRequestAt = Date.now();
+    const ctrl = new AbortController();
+    const timeout = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetch(IMAGE_URL, { cache: 'no-cache', signal: ctrl.signal });
+      state.fetchedAt = new Date();
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const etag = res.headers.get('etag');
+      const lm = res.headers.get('last-modified');
+      if (etag && etag === state.etag && (state.bitmap || state.badSize)) {
+        state.error = null;
+        return;
+      }
+      const blob = await res.blob();
+      const bmp = await createImageBitmap(blob);
+      if (bmp.width !== IMAGE_W || bmp.height !== IMAGE_H) {
+        // The georeference only holds for the known image layout; don't draw misplaced storms.
+        state.etag = etag;
+        state.bitmap = null;
+        state.rawData = null;
+        state.cells = null;
+        state.badSize = `${bmp.width}×${bmp.height}`;
+        throw new Error(`tracker image changed size (${state.badSize}); overlay disabled until the script is updated`);
+      }
+      state.badSize = null;
+      const c = document.createElement('canvas');
+      c.width = bmp.width;
+      c.height = bmp.height;
+      const ctx = c.getContext('2d', { willReadFrequently: true });
+      ctx.drawImage(bmp, 0, 0);
+      state.rawData = ctx.getImageData(0, 0, c.width, c.height);
+      state.etag = etag;
+      state.issued = lm ? new Date(lm) : null;
+      state.cells = countCells(state.rawData.data, c.width, c.height);
+      rekey();
+      state.error = null;
+    } catch (err) {
+      state.error = err && err.name === 'AbortError' ? 'request timed out' : String(err && err.message || err);
+      console.warn('[SEQ tracker] refresh failed:', err);
+    } finally {
+      clearTimeout(timeout);
+      state.inflight = false;
+      updateAll(true);
+    }
+  }
+
+  function rekey() {
+    if (!state.rawData) return;
+    const copy = new ImageData(new Uint8ClampedArray(state.rawData.data), state.rawData.width, state.rawData.height);
+    chromaKey(copy.data, settings.colour);
+    const c = document.createElement('canvas');
+    c.width = copy.width;
+    c.height = copy.height;
+    c.getContext('2d').putImageData(copy, 0, 0);
+    state.bitmap = c;
+  }
+
+  function schedule() {
+    clearInterval(state.timer);
+    state.timer = null;
+    if (!settings.enabled || document.hidden || attachments.size === 0) return;
+    state.timer = setInterval(() => refresh(), Math.max(30, settings.intervalSec) * 1000);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && settings.enabled && attachments.size &&
+        Date.now() - state.lastRequestAt >= settings.intervalSec * 1000) refresh();
+    schedule();
+  });
+
+  // ----- per-view attachment -------------------------------------------------
+
+  class Attachment {
+    constructor(view) {
+      this.view = view;
+      this.container = view.container;
+      this.last = '';
+      this.raf = 0;
+
+      this.canvas = document.createElement('canvas');
+      this.canvas.className = 'seq-ts-overlay';
+      Object.assign(this.canvas.style, {
+        position: 'absolute', inset: '0', width: '100%', height: '100%',
+        pointerEvents: 'none', zIndex: '1',
+      });
+      const surface = this.container.querySelector('.esri-view-surface');
+      if (surface && surface.parentElement) surface.parentElement.insertBefore(this.canvas, surface.nextSibling);
+      else this.container.appendChild(this.canvas);
+
+      this.chip = buildChip(this);
+      this.container.appendChild(this.chip.root);
+
+      this.loop = this.loop.bind(this);
+      this.raf = requestAnimationFrame(this.loop);
+    }
+
+    alive() {
+      return this.container && this.container.isConnected && !this.view.destroyed &&
+        this.view.container === this.container;
+    }
+
+    loop() {
+      if (!this.alive()) { this.destroy(); return; }
+      const v = this.view;
+      const c = v.center;
+      if (c) {
+        const key = `${c.x}|${c.y}|${v.resolution}|${v.width}|${v.height}|${v.rotation}`;
+        if (key !== this.last) {
+          this.last = key;
+          this.draw();
+        }
+      }
+      this.raf = requestAnimationFrame(this.loop);
+    }
+
+    draw() {
+      const v = this.view;
+      const w = v.width || this.container.clientWidth;
+      const h = v.height || this.container.clientHeight;
+      const e = viewExtent(v, w, h);
+      const dpr = window.devicePixelRatio || 1;
+      const cw = Math.round(w * dpr);
+      const ch = Math.round(h * dpr);
+      if (this.canvas.width !== cw || this.canvas.height !== ch) {
+        this.canvas.width = cw;
+        this.canvas.height = ch;
+      }
+      const ctx = this.canvas.getContext('2d');
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+      // The center/resolution box is only exact for north-up views; don't cull rotated ones.
+      this.inCoverage = !!e && (!!v.rotation || intersects(footprintBounds(geo()), e));
+      if (!settings.enabled || !e || !this.inCoverage) return;
+      if (e.spatialReference && e.spatialReference.wkid && ![102100, 3857, 900913].includes(e.spatialReference.wkid)) return;
+
+      const g = geo();
+      let t;
+      if (v.rotation) {
+        // Rotated view: map 3 image corners through the view's own projection.
+        const p = (x, y) => {
+          const [X, Y] = applyAffine(g, x, y);
+          return v.toScreen({ x: X, y: Y, spatialReference: e.spatialReference, type: 'point' });
+        };
+        const o = p(0, 0); const r = p(IMAGE_W, 0); const b = p(0, IMAGE_H);
+        if (!o || !r || !b) return;
+        t = { a: (r.x - o.x) / IMAGE_W, b: (r.y - o.y) / IMAGE_W, c: (b.x - o.x) / IMAGE_H, d: (b.y - o.y) / IMAGE_H, e: o.x, f: o.y };
+      } else {
+        t = imageToScreenTransform(g, e, w, h);
+      }
+      ctx.setTransform(t.a * dpr, t.b * dpr, t.c * dpr, t.d * dpr, t.e * dpr, t.f * dpr);
+      ctx.imageSmoothingEnabled = true;
+      if (state.bitmap) {
+        ctx.globalAlpha = settings.opacity;
+        ctx.drawImage(state.bitmap, 0, 0);
+        ctx.globalAlpha = 1;
+      }
+      if (settings.showFootprint) {
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.beginPath();
+        const corner = (x, y) => [(t.a * x + t.c * y + t.e) * dpr, (t.b * x + t.d * y + t.f) * dpr];
+        const pts = [corner(0, 0), corner(IMAGE_W, 0), corner(IMAGE_W, IMAGE_H), corner(0, IMAGE_H)];
+        ctx.moveTo(...pts[0]);
+        pts.slice(1).forEach((pt) => ctx.lineTo(...pt));
+        ctx.closePath();
+        ctx.setLineDash([6 * dpr, 4 * dpr]);
+        ctx.lineWidth = 1.5 * dpr;
+        ctx.strokeStyle = 'rgba(204,120,51,0.9)';
+        ctx.stroke();
+        ctx.restore();
+      }
+    }
+
+    destroy() {
+      cancelAnimationFrame(this.raf);
+      this.canvas.remove();
+      this.chip.root.remove();
+      attachments.delete(this.view);
+      schedule();
+    }
+  }
+
+  // ----- UI chip --------------------------------------------------------------
+
+  const CSS = `
+  .seq-ts-chip{position:absolute;left:8px;bottom:28px;z-index:5;max-width:min(320px,calc(100% - 16px));
+    font:12px/1.35 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#1d1d1f;
+    background:rgba(255,255,255,.94);border:1px solid rgba(0,0,0,.15);border-radius:8px;
+    box-shadow:0 2px 8px rgba(0,0,0,.18);pointer-events:auto;user-select:none}
+  .seq-ts-chip *{box-sizing:border-box}
+  .seq-ts-row{display:flex;align-items:center;gap:6px;padding:5px 6px 5px 8px}
+  .seq-ts-title{font-weight:600;white-space:nowrap}
+  .seq-ts-status{color:#555;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+  .seq-ts-status.stale,.seq-ts-status.err{color:#b3261e}
+  .seq-ts-btn{all:unset;cursor:pointer;padding:2px 6px;border-radius:5px;line-height:1.2}
+  .seq-ts-btn:hover{background:rgba(0,0,0,.07)}
+  .seq-ts-btn:focus-visible{outline:2px solid #0b57d0}
+  .seq-ts-switch{width:30px;height:16px;border-radius:8px;background:#bbb;position:relative;flex:none}
+  .seq-ts-switch::after{content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s}
+  .seq-ts-switch[aria-checked=true]{background:#cc7833}
+  .seq-ts-switch[aria-checked=true]::after{left:16px}
+  .seq-ts-panel{border-top:1px solid rgba(0,0,0,.1);padding:6px 8px 8px;display:grid;grid-template-columns:auto 1fr;gap:5px 8px;align-items:center}
+  .seq-ts-panel[hidden]{display:none}
+  .seq-ts-panel label{color:#444}
+  .seq-ts-panel select,.seq-ts-panel input[type=range]{width:100%;font:inherit}
+  .seq-ts-panel a{color:#0b57d0}
+  .seq-ts-full{grid-column:1/-1}
+  .seq-ts-nudge{display:flex;gap:2px;align-items:center}
+  `;
+
+  function ensureStyles() {
+    if (document.getElementById('seq-ts-style')) return;
+    const s = document.createElement('style');
+    s.id = 'seq-ts-style';
+    s.textContent = CSS;
+    document.head.appendChild(s);
+  }
+
+  function el(tag, attrs = {}, children = []) {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k === 'text') n.textContent = v;
+      else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+      else n.setAttribute(k, v);
+    }
+    children.forEach((c) => c && n.appendChild(c));
+    return n;
+  }
+
+  function buildChip(att) {
+    ensureStyles();
+    const sw = el('button', { class: 'seq-ts-btn seq-ts-switch', role: 'switch', 'aria-label': 'Show thunderstorm tracker overlay (Shift+T)', title: 'Show thunderstorm tracker (Shift+T)' });
+    const status = el('span', { class: 'seq-ts-status', 'aria-live': 'polite' });
+    const refreshBtn = el('button', { class: 'seq-ts-btn', title: 'Refresh now', 'aria-label': 'Refresh tracker now', text: '↻' });
+    const gear = el('button', { class: 'seq-ts-btn', title: 'Tracker settings', 'aria-label': 'Tracker settings', 'aria-expanded': 'false', text: '⚙' });
+
+    const opacity = el('input', { type: 'range', min: '0.2', max: '1', step: '0.05', 'aria-label': 'Overlay opacity' });
+    const interval = el('select', { 'aria-label': 'Refresh interval' });
+    [[30, '30 s'], [60, '1 min'], [120, '2 min'], [300, '5 min'], [600, '10 min']].forEach(([v, t]) =>
+      interval.appendChild(el('option', { value: String(v), text: t })));
+    const colour = el('select', { 'aria-label': 'Overlay colour' });
+    [['original', 'Original orange'], ['magenta', 'High-contrast magenta'], ['black', 'Black']].forEach(([v, t]) =>
+      colour.appendChild(el('option', { value: v, text: t })));
+    const footprint = el('input', { type: 'checkbox', 'aria-label': 'Show coverage box' });
+    const nudgeOut = el('span', { style: 'color:#666;margin-left:4px' });
+    const nudgeBtn = (label, dx, dy) => el('button', {
+      class: 'seq-ts-btn', text: label, title: `Nudge overlay ${label}`,
+      onclick: () => {
+        if (dx === null) settings.nudge = { dx: 0, dy: 0 };
+        else settings.nudge = { dx: settings.nudge.dx + dx, dy: settings.nudge.dy + dy };
+        saveSettings();
+        updateAll(true);
+      },
+    });
+    const STEP = 500; // metres
+    const panel = el('div', { class: 'seq-ts-panel', hidden: '' }, [
+      el('label', { text: 'Opacity' }), opacity,
+      el('label', { text: 'Refresh' }), interval,
+      el('label', { text: 'Colour' }), colour,
+      el('label', { text: 'Coverage box' }), el('label', {}, [footprint]),
+      el('label', { text: 'Align' }), el('span', { class: 'seq-ts-nudge' }, [
+        nudgeBtn('←', -STEP, 0), nudgeBtn('→', STEP, 0), nudgeBtn('↑', 0, STEP), nudgeBtn('↓', 0, -STEP),
+        nudgeBtn('reset', null, null), nudgeOut,
+      ]),
+      el('div', { class: 'seq-ts-full' }, [
+        el('a', { href: TRACKER_PAGE, target: '_blank', rel: 'noopener', text: 'Official Thunderstorm Tracker (SEQ pilot) ↗' }),
+      ]),
+      el('div', { class: 'seq-ts-full', style: 'color:#666', text: 'Cells show estimated positions at +10, +20 and +30 min. Not affiliated with BoM.' }),
+    ]);
+    const root = el('div', { class: 'seq-ts-chip' }, [
+      el('div', { class: 'seq-ts-row' }, [sw, el('span', { class: 'seq-ts-title', text: '⛈ Storm tracker' }), status, refreshBtn, gear]),
+      panel,
+    ]);
+
+    // Keep map from panning/zooming when interacting with the chip.
+    ['pointerdown', 'mousedown', 'wheel', 'dblclick', 'touchstart', 'keydown', 'click'].forEach((t) =>
+      root.addEventListener(t, (ev) => ev.stopPropagation()));
+
+    sw.addEventListener('click', () => setEnabled(!settings.enabled));
+    refreshBtn.addEventListener('click', () => refresh(true));
+    gear.addEventListener('click', () => {
+      settings.collapsed = !settings.collapsed;
+      saveSettings();
+      updateAll(false);
+    });
+    opacity.addEventListener('input', () => { settings.opacity = +opacity.value; saveSettings(); updateAll(true); });
+    interval.addEventListener('change', () => { settings.intervalSec = +interval.value; saveSettings(); schedule(); });
+    colour.addEventListener('change', () => { settings.colour = colour.value; saveSettings(); rekey(); updateAll(true); });
+    footprint.addEventListener('change', () => { settings.showFootprint = footprint.checked; saveSettings(); updateAll(true); });
+
+    function update() {
+      sw.setAttribute('aria-checked', String(settings.enabled));
+      panel.hidden = settings.collapsed;
+      gear.setAttribute('aria-expanded', String(!settings.collapsed));
+      opacity.value = String(settings.opacity);
+      interval.value = String(settings.intervalSec);
+      colour.value = settings.colour;
+      footprint.checked = settings.showFootprint;
+      const { dx, dy } = settings.nudge;
+      nudgeOut.textContent = dx || dy ? `${(dx / 1000).toFixed(1)}, ${(dy / 1000).toFixed(1)} km` : '';
+
+      let text = '';
+      let cls = '';
+      if (!settings.enabled) text = 'off';
+      else if (state.error && !state.bitmap) { text = `unavailable (${state.error})`; cls = 'err'; }
+      else if (!state.bitmap) text = 'loading…';
+      else if (att.inCoverage === false) text = 'outside SEQ coverage';
+      else {
+        const parts = [];
+        if (state.issued) {
+          const age = Date.now() - state.issued.getTime();
+          parts.push(`${formatIssued(state.issued)} (${formatAge(age)})`);
+          if (age > STALE_MS) cls = 'stale';
+        }
+        parts.push(state.cells === 0 ? 'no tracked storms' : `${state.cells} cell${state.cells === 1 ? '' : 's'}`);
+        if (state.error) { parts.push('⚠ refresh failed'); cls = 'err'; }
+        text = parts.join(' · ');
+      }
+      status.textContent = text;
+      status.className = `seq-ts-status ${cls}`;
+      status.title = state.issued
+        ? `Issued ${state.issued.toLocaleString('en-AU', { timeZone: 'Australia/Brisbane' })} AEST` +
+          (state.fetchedAt ? `\nLast checked ${state.fetchedAt.toLocaleTimeString('en-AU')}` : '')
+        : text;
+    }
+
+    return { root, update };
+  }
+
+  function updateAll(redraw) {
+    for (const att of attachments.values()) {
+      if (redraw) { att.last = ''; att.draw(); }
+      att.chip.update();
+    }
+  }
+
+  function setEnabled(on) {
+    settings.enabled = on;
+    saveSettings();
+    if (on) refresh();
+    schedule();
+    updateAll(true);
+  }
+
+  // ----- discovery --------------------------------------------------------------
+
+  function scan() {
+    document.querySelectorAll('.esri-view').forEach((node) => {
+      if (node.__seqTsView && attachments.has(node.__seqTsView)) return;
+      if (node.__seqTsChecked && node.__seqTsChecked > Date.now() - 2000) return;
+      node.__seqTsChecked = Date.now();
+      const view = findMapViewFromElement(node);
+      if (!view || !view.container || !view.extent) return;
+      node.__seqTsView = view;
+      if (attachments.has(view)) return;
+      attachments.set(view, new Attachment(view));
+      if (!state.bitmap && settings.enabled) refresh();
+      schedule();
+      updateAll(false);
+    });
+  }
+
+  let scanQueued = false;
+  const mo = new MutationObserver(() => {
+    if (scanQueued) return;
+    scanQueued = true;
+    setTimeout(() => { scanQueued = false; scan(); }, 250);
+  });
+  mo.observe(document.documentElement, { childList: true, subtree: true });
+  // The MapView finishes initialising a little after its DOM appears; poll briefly as a backstop.
+  setInterval(scan, 3000);
+  scan();
+
+  // Refresh the "x min ago" text.
+  setInterval(() => updateAll(false), 30000);
+
+  document.addEventListener('keydown', (ev) => {
+    if (!ev.shiftKey || ev.ctrlKey || ev.metaKey || ev.altKey || ev.key !== 'T') return;
+    const t = ev.target;
+    if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return;
+    if (!attachments.size) return;
+    setEnabled(!settings.enabled);
+  });
+
+  // Small debug handle for troubleshooting from DevTools.
+  window.__seqThunderstormTracker = { core, settings, state, attachments, refresh };
+})();
