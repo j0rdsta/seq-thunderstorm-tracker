@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SEQ Thunderstorm Tracker card preview</title>
+<!--
+  Tries the built card outside Home Assistant, with a made-up `hass` object.
+
+    npm run build && npx --yes serve .        (or: python3 -m http.server)
+    open http://localhost:3000/card/preview.html
+
+  Options in the address:
+    ?image=<address of a tracker image you saved>   default: a drawn stand-in, so nothing is fetched from BoM
+    &source=bom                                    load the live picture from the Bureau instead
+    &dark=1   &bridge=off   &radar=1   &lat=-27.47&lon=153.02
+-->
+<style>
+  body { margin: 0; padding: 24px; font-family: system-ui, sans-serif; background: #f2f2f2; --primary-text-color: #1c1c1c;
+    --secondary-text-color: #5c5c5c; --secondary-background-color: #e5e3df; }
+  body.dark { background: #111; --primary-text-color: #e6e6e6; --secondary-text-color: #a0a0a0; --secondary-background-color: #222; }
+  .frame { width: min(520px, 100%); height: 560px; }
+  ha-card { background: #fff; border-radius: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.25); }
+  body.dark ha-card { background: #1c1c1c; }
+</style>
+</head>
+<body>
+<div class="frame" id="frame"></div>
+<script>
+  // Stand-ins for the two Home Assistant elements the card uses.
+  customElements.define('ha-card', class extends HTMLElement {});
+  customElements.define('ha-icon', class extends HTMLElement {
+    connectedCallback() { this.textContent = '⌂'; }
+  });
+</script>
+<script src="../custom_components/seq_thunderstorm_tracker/frontend/seq-thunderstorm-tracker-card.js"></script>
+<script>
+  const q = new URLSearchParams(location.search);
+  const lat = Number(q.get('lat') || -27.4698);
+  const lon = Number(q.get('lon') || 153.0251);
+  const dark = q.get('dark') === '1';
+  const bridgeOn = q.get('bridge') !== 'off';
+  document.body.classList.toggle('dark', dark);
+
+  /** A stand-in tracker picture: basemap colour, two storm ovals, an arrow and three arcs each. */
+  function drawnTracker() {
+    const c = document.createElement('canvas');
+    c.width = 600; c.height = 643;
+    const x = c.getContext('2d');
+    x.fillStyle = 'rgb(229,222,201)'; x.fillRect(0, 0, 600, 643);
+    x.fillStyle = 'rgb(191,219,238)'; x.fillRect(470, 0, 130, 643);
+    for (const [cx, cy, heading] of [[270, 360, -0.1], [330, 250, 0.5]]) {
+      x.save(); x.translate(cx, cy); x.rotate(heading);
+      x.fillStyle = 'rgb(245,189,138)'; x.strokeStyle = 'rgb(204,120,51)'; x.lineWidth = 2;
+      x.beginPath(); x.ellipse(0, 0, 22, 14, 0, 0, Math.PI * 2); x.fill(); x.stroke();
+      x.lineWidth = 3; x.beginPath(); x.moveTo(0, 0); x.lineTo(70, 0); x.stroke();
+      x.beginPath(); x.moveTo(70, 0); x.lineTo(60, -6); x.lineTo(60, 6); x.closePath(); x.fillStyle = 'rgb(204,120,51)'; x.fill();
+      x.lineWidth = 2;
+      for (const d of [40, 70, 100]) { x.beginPath(); x.ellipse(d - 20, 0, 22, 18, 0, -1.1, 1.1); x.stroke(); }
+      x.restore();
+    }
+    return c.toDataURL('image/png');
+  }
+
+  const now = new Date();
+  const entity = (id, key, device) => [id, { entity_id: id, platform: 'seq_thunderstorm_tracker', translation_key: key, device_id: device }];
+  const hass = {
+    config: { latitude: lat, longitude: lon },
+    themes: { darkMode: dark },
+    hassUrl: (path) => path,
+    callWS: () => Promise.reject(new Error('no map tile proxy in the preview')),
+    entities: Object.fromEntries([
+      entity('sensor.storms', 'storms'), entity('sensor.issued', 'issued'),
+      entity('binary_sensor.bridge', 'bridge'), entity('image.tracker', 'tracker'),
+      entity('sensor.nearest', 'nearest_storm', 'd1'), entity('sensor.track', 'nearest_forecast_track', 'd1'),
+      entity('binary_sensor.nearby', 'storm_nearby', 'd1'),
+    ]),
+    states: {
+      'zone.home': { state: '1', attributes: { latitude: lat, longitude: lon, friendly_name: 'Home', icon: 'mdi:home' } },
+      'person.jordan': { state: 'not_home', attributes: { latitude: lat + 0.12, longitude: lon - 0.3, friendly_name: 'Jordan' } },
+      'sensor.storms': { state: bridgeOn ? '16' : 'unavailable', attributes: { description: 'At 3:40 pm, thunderstorms were detected on the weather radar near Laidley and Esk. They are forecast to affect Ipswich by 4:10 pm.' } },
+      'sensor.issued': { state: now.toISOString(), attributes: {} },
+      'binary_sensor.bridge': { state: bridgeOn ? 'on' : 'off', attributes: {} },
+      'image.tracker': { state: now.toISOString(), attributes: { entity_picture: q.get('image') || drawnTracker() } },
+      'sensor.nearest': { state: bridgeOn ? '40.3' : 'unavailable', attributes: bridgeOn ? { target: 'zone.home', direction: 'W', in_coverage: true } : {} },
+      'sensor.track': { state: bridgeOn ? '15.4' : 'unavailable', attributes: bridgeOn ? { target: 'zone.home', direction: 'W' } : {} },
+      'binary_sensor.nearby': { state: bridgeOn ? 'off' : 'unavailable', attributes: bridgeOn ? { target: 'zone.home', radius_km: 20 } : {} },
+    },
+  };
+
+  const card = document.createElement('seq-thunderstorm-tracker-card');
+  card.setConfig({
+    entities: ['zone.home', 'person.jordan'],
+    source: q.get('source') || 'home_assistant',
+    radar: q.get('radar') === '1',
+    zoom: Number(q.get('zoom') || 8),
+    storm_colour: q.get('colour') || 'original',
+  });
+  card.hass = hass;
+  document.getElementById('frame').appendChild(card);
+  window.card = card;
+</script>
+</body>
+</html>

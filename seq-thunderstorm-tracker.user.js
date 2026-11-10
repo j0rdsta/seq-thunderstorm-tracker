@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BoM SEQ Thunderstorm Tracker Overlay
 // @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
-// @version      0.5.0
+// @version      0.6.0
 // @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
 // @author       j0rdsta
 // @license      MIT
@@ -21,9 +21,7 @@
 (function () {
   'use strict';
 
-  // ---------------------------------------------------------------------------
-  // Pure helpers (exported for Node tests)
-  // ---------------------------------------------------------------------------
+  /** Where the tracker image sits on the Earth: constants, Web Mercator and the affine georeference. */
 
   const IMAGE_URL = 'https://www.bom.gov.au/fwo/IDA00050.png';
   const TRACKER_PAGE = 'https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml';
@@ -46,6 +44,13 @@
     return [
       (lon * Math.PI / 180) * R,
       Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * R,
+    ];
+  }
+
+  function mercatorToLonLat(x, y) {
+    return [
+      (x / R) * 180 / Math.PI,
+      (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * 180 / Math.PI,
     ];
   }
 
@@ -107,6 +112,26 @@
   function intersects(a, b) {
     return a.xmin < b.xmax && a.xmax > b.xmin && a.ymin < b.ymax && a.ymax > b.ymin;
   }
+
+  const georef = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    CORNERS: CORNERS,
+    IMAGE_H: IMAGE_H,
+    IMAGE_URL: IMAGE_URL,
+    IMAGE_W: IMAGE_W,
+    R: R,
+    TRACKER_PAGE: TRACKER_PAGE,
+    applyAffine: applyAffine,
+    footprintBounds: footprintBounds,
+    imageToMercatorAffine: imageToMercatorAffine,
+    imageToScreenTransform: imageToScreenTransform,
+    intersects: intersects,
+    invertAffine: invertAffine,
+    lonLatToMercator: lonLatToMercator,
+    mercatorToLonLat: mercatorToLonLat
+  });
+
+  /** Telling storms from basemap: the chroma key, the storm fingerprint and cell detection. */
 
   function rgbToHs(r, g, b) {
     const max = Math.max(r, g, b);
@@ -187,7 +212,9 @@
 
   /**
    * Find filled storm cells (current positions) as connected components of the fill colour.
-   * Operates on the ORIGINAL pixels. Returns [{ x, y, area }] with centroids in image px.
+   * Operates on the ORIGINAL pixels. Returns [{ x, y, area, vxx, vyy, vxy }]: centroid and area in
+   * image px, plus the spread of the cell's pixels about its centroid (variances and covariance,
+   * px²), which is enough to recover the drawn ellipse (see cellEllipse in analysis.js).
    */
   function findCells(data, w, h, minPixels = 40) {
     const mask = new Uint8Array(w * h);
@@ -203,17 +230,25 @@
       let size = 0;
       let sx = 0;
       let sy = 0;
+      let sxx = 0;
+      let syy = 0;
+      let sxy = 0;
       while (stack.length) {
         const q = stack.pop();
         const x = q % w;
         const y = (q - x) / w;
         size++; sx += x; sy += y;
+        sxx += x * x; syy += y * y; sxy += x * y;
         if (x > 0 && mask[q - 1] === 1) { mask[q - 1] = 2; stack.push(q - 1); }
         if (x < w - 1 && mask[q + 1] === 1) { mask[q + 1] = 2; stack.push(q + 1); }
         if (y > 0 && mask[q - w] === 1) { mask[q - w] = 2; stack.push(q - w); }
         if (y < h - 1 && mask[q + w] === 1) { mask[q + w] = 2; stack.push(q + w); }
       }
-      if (size >= minPixels) cells.push({ x: sx / size, y: sy / size, area: size });
+      if (size >= minPixels) {
+        const x = sx / size;
+        const y = sy / size;
+        cells.push({ x, y, area: size, vxx: sxx / size - x * x, vyy: syy / size - y * y, vxy: sxy / size - x * y });
+      }
     }
     return cells;
   }
@@ -221,6 +256,18 @@
   function countCells(data, w, h, minPixels = 40) {
     return findCells(data, w, h, minPixels).length;
   }
+
+  const keying = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    COLOUR_MODES: COLOUR_MODES,
+    chromaKey: chromaKey,
+    countCells: countCells,
+    findCells: findCells,
+    isCellFill: isCellFill,
+    rgbToHs: rgbToHs,
+    stormAlpha: stormAlpha,
+    stormHash: stormHash
+  });
 
   // ----- Experimental storm paths ------------------------------------------------
   // Our own rough estimate, NOT a Bureau product: link storm cells across saved tracker
@@ -342,6 +389,16 @@
     return predictions.length ? { vx, vy, speedKmh: robustSpeed, predictions } : null;
   }
 
+  const tracks = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    KM_PER_PX: KM_PER_PX,
+    TRACK_DEFAULTS: TRACK_DEFAULTS,
+    linkTracks: linkTracks,
+    predictTrack: predictTrack
+  });
+
+  /** Finding and reading the ArcGIS MapView on a bom.gov.au location page. */
+
   /** Duck-type check for an ArcGIS JS 4.x MapView. */
   function looksLikeMapView(v) {
     try {
@@ -392,6 +449,15 @@
     const e = view.extent;
     return e ? { xmin: e.xmin, xmax: e.xmax, ymin: e.ymin, ymax: e.ymax, spatialReference: e.spatialReference } : null;
   }
+
+  const mapview = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    findMapViewFromElement: findMapViewFromElement,
+    looksLikeMapView: looksLikeMapView,
+    viewExtent: viewExtent
+  });
+
+  /** Times the way BoM writes them, and matching tracker images to radar frames. */
 
   function formatAge(ms) {
     const mins = Math.round(ms / 60000);
@@ -459,23 +525,25 @@
     return best;
   }
 
-  const core = {
-    IMAGE_URL, TRACKER_PAGE, IMAGE_W, IMAGE_H, CORNERS,
-    lonLatToMercator, imageToMercatorAffine, applyAffine, invertAffine, imageToScreenTransform,
-    footprintBounds, intersects, rgbToHs, stormAlpha, chromaKey, stormHash, isCellFill, countCells, findCells,
-    KM_PER_PX, linkTracks, predictTrack,
-    looksLikeMapView, findMapViewFromElement, viewExtent, formatAge, formatAgeLong, formatIssued,
-    parseTimelineLabel, pickTrackerFrame,
-  };
+  const time = /*#__PURE__*/Object.freeze({
+    __proto__: null,
+    MONTHS: MONTHS,
+    TZ_OFFSETS_MIN: TZ_OFFSETS_MIN,
+    formatAge: formatAge,
+    formatAgeLong: formatAgeLong,
+    formatIssued: formatIssued,
+    parseTimelineLabel: parseTimelineLabel,
+    pickTrackerFrame: pickTrackerFrame
+  });
 
-  if (typeof module !== 'undefined' && module.exports) {
-    module.exports = core;
-    return;
-  }
+  /**
+   * The overlay userscript's browser runtime: finds the radar map on a bom.gov.au location page
+   * and draws the Thunderstorm Tracker on it. Built to ../../seq-thunderstorm-tracker.user.js.
+   */
 
-  // ---------------------------------------------------------------------------
-  // Browser runtime
-  // ---------------------------------------------------------------------------
+
+  // The pure helpers, kept together for the debug handle at the bottom of this file.
+  const core = { ...georef, ...keying, ...tracks, ...mapview, ...time };
 
   const STORE_KEY = 'seqThunderstormTracker.v1';
   const DEFAULTS = {
@@ -977,27 +1045,27 @@
   // ----- UI (reuses bom.gov.au markup and classes) ---------------------------
 
   const CSS = `
-  .seq-ts-info{margin:24px 0 8px}
-  .seq-ts-info[hidden]{display:none}
-  .seq-ts-info h3{margin:0 0 4px}
-  .seq-ts-info__legend{list-style:none;padding:0;margin:12px 0 0;display:flex;flex-wrap:wrap;gap:8px 24px;
-    font-size:14px;line-height:20px;color:#4a4a4a}
-  .seq-ts-info__legend li{display:flex;align-items:center;gap:8px;margin:0}
-  .seq-ts-info__legend li[hidden]{display:none}
-  .seq-ts-info__legend img,.seq-ts-info__legend svg{height:24px;width:auto;flex:none}
-  .seq-ts-info .seq-ts-info__meta{margin-top:8px;font-size:14px;line-height:20px}
-  .seq-ts-meta__warn{color:#b3261e}
-  .seq-ts-meta__actions{display:inline-flex;gap:10px;margin-left:10px}
-  .seq-ts-linkbtn{all:unset;cursor:pointer;text-decoration:underline;text-underline-offset:2px;color:inherit}
-  .seq-ts-linkbtn:hover{text-decoration-thickness:2px}
-  .seq-ts-linkbtn:focus-visible{outline:2px solid currentColor;outline-offset:2px;border-radius:2px}
-  .seq-ts-fieldset{margin-top:24px}
-  .seq-ts-group{margin:12px 0 0}
-  .seq-ts-group__label{margin:0 0 4px}
-  .seq-ts-radios{display:flex;flex-wrap:wrap;gap:0 20px}
-  .seq-ts-nudge{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
-  .seq-ts-fieldset .overlay-description a{color:inherit}
-  `;
+.seq-ts-info{margin:24px 0 8px}
+.seq-ts-info[hidden]{display:none}
+.seq-ts-info h3{margin:0 0 4px}
+.seq-ts-info__legend{list-style:none;padding:0;margin:12px 0 0;display:flex;flex-wrap:wrap;gap:8px 24px;
+  font-size:14px;line-height:20px;color:#4a4a4a}
+.seq-ts-info__legend li{display:flex;align-items:center;gap:8px;margin:0}
+.seq-ts-info__legend li[hidden]{display:none}
+.seq-ts-info__legend img,.seq-ts-info__legend svg{height:24px;width:auto;flex:none}
+.seq-ts-info .seq-ts-info__meta{margin-top:8px;font-size:14px;line-height:20px}
+.seq-ts-meta__warn{color:#b3261e}
+.seq-ts-meta__actions{display:inline-flex;gap:10px;margin-left:10px}
+.seq-ts-linkbtn{all:unset;cursor:pointer;text-decoration:underline;text-underline-offset:2px;color:inherit}
+.seq-ts-linkbtn:hover{text-decoration-thickness:2px}
+.seq-ts-linkbtn:focus-visible{outline:2px solid currentColor;outline-offset:2px;border-radius:2px}
+.seq-ts-fieldset{margin-top:24px}
+.seq-ts-group{margin:12px 0 0}
+.seq-ts-group__label{margin:0 0 4px}
+.seq-ts-radios{display:flex;flex-wrap:wrap;gap:0 20px}
+.seq-ts-nudge{display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+.seq-ts-fieldset .overlay-description a{color:inherit}
+`;
 
   function ensureStyles() {
     if (document.getElementById('seq-ts-style')) return;
@@ -1432,4 +1500,5 @@
 
   // Small debug handle for troubleshooting from DevTools.
   window.__seqThunderstormTracker = { core, settings, state, attachments, frames, refresh };
+
 })();

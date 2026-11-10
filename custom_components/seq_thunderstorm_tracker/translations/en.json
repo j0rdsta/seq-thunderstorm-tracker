@@ -1,0 +1,57 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "SEQ Thunderstorm Tracker",
+        "description": "Storm positions come from the Bureau of Meteorology's Thunderstorm Tracker (Southeast Queensland pilot). Home Assistant does not fetch them itself: a small userscript in your browser sends them while a bom.gov.au tab is open. You get its address on the next screen.",
+        "data": {
+          "targets": "Places to measure from",
+          "radius_km": "Alert distance"
+        },
+        "data_description": {
+          "targets": "Zones, people or device trackers. Each gets its own distance sensors and map.",
+          "radius_km": "A storm closer than this turns on the place's \"Storm nearby\" sensor and is drawn as a ring on its map."
+        }
+      }
+    },
+    "create_entry": {
+      "default": "Install the bridge userscript from the project page, then give it this webhook address (userscript manager menu, \"Set Home Assistant webhook address\"). The first is for use away from home, the second for your home network:\n\n{webhook_url}\n\nYou can find the address again under Configure. Treat it like a password."
+    },
+    "abort": {
+      "single_instance_allowed": "Already set up. Use Configure to change it."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "SEQ Thunderstorm Tracker",
+        "description": "Webhook address for the bridge userscript (treat it like a password):\n\n{webhook_url}",
+        "data": {
+          "targets": "Places to measure from",
+          "radius_km": "Alert distance",
+          "stale_minutes": "Treat tracker data as out of date after",
+          "map_span_km": "Width of each place's map"
+        },
+        "data_description": {
+          "stale_minutes": "When nothing newer has arrived, the sensors become unavailable instead of showing old storms or clear skies. The tracker updates about every 6 minutes."
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "storms": { "name": "Tracked storms", "unit_of_measurement": "storms" },
+      "issued": { "name": "Tracker issued" },
+      "nearest_storm": { "name": "Nearest storm" },
+      "nearest_forecast_track": { "name": "Nearest forecast track" }
+    },
+    "binary_sensor": {
+      "bridge": { "name": "Bridge" },
+      "storm_nearby": { "name": "Storm nearby" }
+    },
+    "image": {
+      "tracker": { "name": "Tracker image" },
+      "map": { "name": "Map" }
+    }
+  }
+}

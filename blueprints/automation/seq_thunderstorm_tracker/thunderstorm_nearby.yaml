@@ -1,0 +1,164 @@
+blueprint:
+  name: Thunderstorm nearby (SEQ Thunderstorm Tracker)
+  description: >-
+    Sends a phone notification, with a map, when a storm on the Bureau of Meteorology's
+    Thunderstorm Tracker (Southeast Queensland pilot) comes within a distance of a place or person.
+
+
+    Needs the SEQ Thunderstorm Tracker integration and its bridge userscript running in a browser.
+    It only knows about storms while that browser has a bom.gov.au tab open. This is not a warning
+    service: the Bureau's warnings come first.
+  domain: automation
+  author: Jordan Gardiner
+  source_url: https://github.com/j0rdsta/seq-thunderstorm-tracker/blob/main/blueprints/automation/seq_thunderstorm_tracker/thunderstorm_nearby.yaml
+  homeassistant:
+    min_version: "2024.10.0"
+  input:
+    who:
+      name: Where and who
+      icon: mdi:map-marker-radius
+      input:
+        distance_sensors:
+          name: Distance sensors
+          description: >-
+            "Nearest storm" for the place or person to watch. Add its "Nearest forecast track"
+            sensor as well to hear earlier, when the Bureau's arrows and 10 to 30 minute arcs
+            reach the distance before the storm itself does.
+          selector:
+            entity:
+              multiple: true
+              filter:
+                - integration: seq_thunderstorm_tracker
+                  domain: sensor
+                  device_class: distance
+        notify_device:
+          name: Phone to notify
+          description: A phone or tablet with the Home Assistant app.
+          selector:
+            device:
+              filter:
+                - integration: mobile_app
+    alert:
+      name: Alert
+      icon: mdi:weather-lightning
+      input:
+        distance:
+          name: Distance
+          description: Notify when a sensor reads less than this.
+          default: 20
+          selector:
+            number:
+              min: 1
+              max: 150
+              step: 1
+              unit_of_measurement: km
+              mode: box
+        cooldown:
+          name: Quiet time between notifications
+          description: A storm hovering around the distance would otherwise notify again and again.
+          default: 30
+          selector:
+            number:
+              min: 5
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: box
+        map_image:
+          name: Map to attach
+          description: The place's "Map" image. Leave empty to send text only.
+          default: ""
+          selector:
+            entity:
+              filter:
+                - integration: seq_thunderstorm_tracker
+                  domain: image
+    more:
+      name: More
+      icon: mdi:cog
+      collapsed: true
+      input:
+        open_url:
+          name: Open when tapped
+          description: A web address or a dashboard path such as /lovelace/storms.
+          default: https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml
+          selector:
+            text:
+        interruption_level:
+          name: iPhone interruption level
+          description: Time sensitive breaks through a Focus.
+          default: active
+          selector:
+            select:
+              options:
+                - label: Normal
+                  value: active
+                - label: Time sensitive
+                  value: time-sensitive
+        extra_actions:
+          name: Then also do
+          description: Anything else to run after the notification, such as an announcement.
+          default: []
+          selector:
+            action:
+
+mode: single
+max_exceeded: silent
+
+variables:
+  cooldown: !input cooldown
+  notify_device: !input notify_device
+  map_image: !input map_image
+  open_url: !input open_url
+  interruption_level: !input interruption_level
+
+triggers:
+  - trigger: numeric_state
+    entity_id: !input distance_sensors
+    below: !input distance
+
+conditions:
+  # A sensor coming back from unavailable re-arms the trigger, so an unchanged storm can fire
+  # again. The quiet time below is what stops that turning into repeats.
+  - condition: template
+    value_template: >-
+      {{ trigger.platform == 'numeric_state'
+         and trigger.to_state is not none
+         and is_number(trigger.to_state.state) }}
+  - condition: template
+    value_template: >-
+      {{ this.attributes.last_triggered is none
+         or (now() - this.attributes.last_triggered).total_seconds() >= (cooldown | float(30)) * 60 }}
+
+actions:
+  - variables:
+      target: "{{ trigger.to_state.attributes.target | default('', true) }}"
+      place: "{{ states[target].name if target and states[target] is not none else 'you' }}"
+      km: "{{ trigger.to_state.state | float | round(0) | int }}"
+      direction: "{{ trigger.to_state.attributes.direction | default('', true) }}"
+      issued: >-
+        {% set at = trigger.to_state.attributes.issued | default(none, true) %}
+        {{ (at | as_timestamp | timestamp_custom('%-I:%M %p', true) | lower) if at else '' }}
+      message: >-
+        {% if trigger.to_state.attributes.measures == 'forecast_track' -%}
+        {% set lead = "A tracked storm's forecast path comes within " ~ km ~ " km of " ~ place ~ (" (to the " ~ direction ~ ")" if direction else "") ~ "." %}
+        {%- else -%}
+        {% set lead = "Thunderstorm " ~ km ~ " km " ~ (direction ~ " " if direction else "") ~ "of " ~ place ~ "." %}
+        {%- endif -%}
+        {{ lead }} Bureau's Thunderstorm Tracker{{ ', ' ~ issued if issued }}. Not a warning: check current warnings.
+      payload: >-
+        {% set data = {
+          'tag': 'seq-thunderstorm-' ~ (target or 'nearby'),
+          'group': 'thunderstorms',
+          'url': open_url,
+          'clickAction': open_url,
+          'push': {'interruption-level': interruption_level}
+        } %}
+        {{ dict(data, image='/api/image_proxy/' ~ map_image) if map_image else data }}
+  - action: "notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}"
+    data:
+      title: Thunderstorm nearby
+      message: "{{ message }}"
+      data: "{{ payload }}"
+  - choose: []
+    default: !input extra_actions

@@ -1,8 +1,11 @@
 ---
 name: Bug report
-about: The overlay is missing, misaligned or misbehaving
+about: The overlay, the Home Assistant card or sensors, the bridge or the widget is misbehaving
 labels: bug
 ---
+
+**Which part**
+<!-- Overlay userscript / Home Assistant card / Home Assistant sensors / bridge userscript / blueprint / iOS widget -->
 
 **BoM page URL**
 <!-- e.g. https://www.bom.gov.au/location/australia/queensland/southeast-coast/... -->
@@ -18,6 +21,7 @@ labels: bug
 - Browser + version:
 - Userscript manager + version (Tampermonkey / Violentmonkey):
 - Script version:
+- Home Assistant version (if it is involved):
 
 **Console output**
 <!-- DevTools console lines starting with "[SEQ tracker]", and the output of

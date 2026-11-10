@@ -1,0 +1,14 @@
+{
+  "domain": "seq_thunderstorm_tracker",
+  "name": "SEQ Thunderstorm Tracker",
+  "codeowners": ["@j0rdsta"],
+  "config_flow": true,
+  "dependencies": ["http", "webhook", "frontend"],
+  "documentation": "https://github.com/j0rdsta/seq-thunderstorm-tracker/blob/main/docs/home-assistant.md",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/j0rdsta/seq-thunderstorm-tracker/issues",
+  "requirements": ["Pillow"],
+  "single_config_entry": true,
+  "version": "0.6.0"
+}

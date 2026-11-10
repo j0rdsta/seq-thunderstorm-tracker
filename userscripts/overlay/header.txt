@@ -1,0 +1,19 @@
+// ==UserScript==
+// @name         BoM SEQ Thunderstorm Tracker Overlay
+// @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @version      {{version}}
+// @description  Overlays the Bureau of Meteorology's "Thunderstorm Tracker – Southeast Queensland Pilot" onto the interactive radar map on bom.gov.au, with auto-refresh.
+// @author       j0rdsta
+// @license      MIT
+// @match        https://www.bom.gov.au/location/*
+// @grant        none
+// @run-at       document-idle
+// @noframes
+// @homepageURL  https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @supportURL   https://github.com/j0rdsta/seq-thunderstorm-tracker/issues
+// @updateURL    https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker.user.js
+// @downloadURL  https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker.user.js
+// ==/UserScript==
+
+/* Not affiliated with or endorsed by the Bureau of Meteorology.
+ * Tracker imagery © Commonwealth of Australia, Bureau of Meteorology; it is fetched live by your browser. */

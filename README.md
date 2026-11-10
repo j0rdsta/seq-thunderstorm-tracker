@@ -1,4 +1,35 @@
-# BoM SEQ Thunderstorm Tracker Overlay
+# SEQ Thunderstorm Tracker
+
+The Bureau of Meteorology's
+[**Thunderstorm Tracker – Southeast Queensland Pilot**](https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml)
+in the places you already look: on the radar map on bom.gov.au, on a Home Assistant dashboard, and
+on your phone when a storm gets close.
+
+> **Unofficial.** Not affiliated with or endorsed by the Bureau of Meteorology. The tracker is a BoM
+> *pilot* product and only covers Southeast Queensland. Always check BoM's official warnings.
+
+## What's here
+
+| | What it does | Where |
+|---|---|---|
+| **Overlay userscript** | Draws the tracker on the radar map on bom.gov.au location pages. | [below](#overlay-userscript) |
+| **Home Assistant integration and card** | A map card for your dashboard, plus sensors for how far the nearest storm is from home or from a person. | [docs/home-assistant.md](docs/home-assistant.md) |
+| **Bridge userscript** | Sends storm positions from your browser to your Home Assistant. The sensors and notifications need it. | [docs/home-assistant.md](docs/home-assistant.md#set-up-the-bridge) |
+| **Notification blueprint** | Tells your phone when a storm comes within a distance you choose, with a map. | [docs/home-assistant.md](docs/home-assistant.md#notifications) |
+| **iOS widget** | The map and the distance on your Home Screen or Lock Screen. | [docs/ios.md](docs/ios.md) |
+
+They all share one core (`packages/core`): the same georeference, the same way of telling storms
+from the basemap, and the same storm detection.
+
+### One thing to know first
+
+The Bureau turns away anything that is not a browser, and this project does not work around that.
+So nothing here fetches bom.gov.au from a server. The overlay and the dashboard card show what
+your own browser loads. Storm distances and notifications in Home Assistant come from the bridge
+userscript, which means they only work while a browser somewhere has a bom.gov.au tab open.
+When it stops, the sensors say *unavailable*. They never fall back to "no storms".
+
+## Overlay userscript
 
 A userscript that draws the Bureau of Meteorology's
 [**Thunderstorm Tracker – Southeast Queensland Pilot**](https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml)
@@ -7,10 +38,7 @@ directly on the interactive radar map on bom.gov.au location pages (e.g.
 You see BoM's tracked storm cells and their estimated positions at +10, +20 and +30 minutes on top of the
 live rain radar. The overlay follows the map as you pan and zoom, and refreshes itself automatically.
 
-> **Unofficial.** Not affiliated with or endorsed by the Bureau of Meteorology. The tracker is a BoM
-> *pilot* product and only covers Southeast Queensland. Always check BoM's official warnings.
-
-## Install
+### Install
 
 1. Install a userscript manager:
    [Tampermonkey](https://www.tampermonkey.net/) (Chrome, Edge, Firefox, Safari) or
@@ -24,7 +52,7 @@ live rain radar. The overlay follows the map as you pan and zoom, and refreshes 
 
 Updates install automatically through your userscript manager.
 
-## Features
+### Features
 
 - **Aligned overlay**: storm cells, movement arrows and forecast arcs are drawn on the radar map in the
   right place at every zoom level. The tracker's basemap (land, sea, borders, labels) is keyed out, so
@@ -64,7 +92,7 @@ Updates install automatically through your userscript manager.
   a new one (typically every 5–10 minutes). There are never more than 2 requests a minute, and it pauses
   while the tab is in the background.
 
-## How it works
+### How it works
 
 - The new bom.gov.au map is an [ArcGIS Maps SDK for JavaScript](https://developers.arcgis.com/javascript/)
   `MapView` in Web Mercator. The script finds that view through React's internal fiber tree on the
@@ -81,7 +109,7 @@ Updates install automatically through your userscript manager.
   use a slightly different projection, so expect up to ~1–2 km of error in the corners. Use the nudge
   buttons if it looks off.
 
-## Limitations
+### Limitations
 
 - **Experimental storm paths are a rough guess.** A storm is only linked between images when the match is
   unambiguous (similar size, consistent with its recent motion, and clearly the best match both ways).
@@ -101,16 +129,24 @@ Updates install automatically through your userscript manager.
 ## Development
 
 ```sh
-npm test    # unit tests (Node ≥ 20, no dependencies)
+npm install
+npm run build        # builds the two userscripts and the card from the sources
+npm test             # JavaScript tests (Node 20 or later)
+npm run test:python  # Home Assistant integration tests (needs uv)
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Please don't add automated or headless access to bom.gov.au.
-The Bureau blocks it and asks people not to scrape the site.
+The built userscripts and the card are committed, because that is where userscript managers and
+Home Assistant fetch them from. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout. Please
+don't add server-side, automated or headless access to bom.gov.au. The Bureau blocks it and asks
+people not to scrape the site.
 
 ## Licence and attribution
 
 Code: [MIT](LICENSE) © 2026 j0rdsta.
 
 Thunderstorm Tracker imagery and radar data © Commonwealth of Australia, Bureau of Meteorology.
-This project does not host or redistribute BoM content. The script only displays what your browser loads
-from bom.gov.au while you view it. See BoM's [copyright notice](https://www.bom.gov.au/other/copyright.shtml).
+This project does not host or redistribute BoM content. The overlay and the card only display what
+your browser loads from bom.gov.au, and the bridge sends the tracker picture only to your own Home
+Assistant. See BoM's [copyright notice](https://www.bom.gov.au/other/copyright.shtml).
+
+The dashboard card bundles [Leaflet](https://leafletjs.com/) (BSD-2-Clause). Its base map is © OpenStreetMap contributors.

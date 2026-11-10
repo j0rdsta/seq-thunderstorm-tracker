@@ -1,16 +1,44 @@
 {
   "name": "seq-thunderstorm-tracker",
-  "version": "0.5.0",
-  "description": "Userscript that overlays the BoM Thunderstorm Tracker (SEQ pilot) on the bom.gov.au radar map.",
+  "version": "0.6.0",
+  "description": "The BoM Thunderstorm Tracker (SEQ pilot) on the bom.gov.au radar map, on a Home Assistant dashboard and on your phone.",
   "license": "MIT",
   "author": "j0rdsta",
   "homepage": "https://github.com/j0rdsta/seq-thunderstorm-tracker#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/j0rdsta/seq-thunderstorm-tracker.git" },
-  "bugs": { "url": "https://github.com/j0rdsta/seq-thunderstorm-tracker/issues" },
-  "keywords": ["userscript", "tampermonkey", "violentmonkey", "bom", "weather", "radar", "thunderstorm", "queensland"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/j0rdsta/seq-thunderstorm-tracker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/j0rdsta/seq-thunderstorm-tracker/issues"
+  },
+  "keywords": [
+    "userscript",
+    "tampermonkey",
+    "violentmonkey",
+    "home-assistant",
+    "lovelace",
+    "bom",
+    "weather",
+    "radar",
+    "thunderstorm",
+    "queensland"
+  ],
   "private": true,
-  "engines": { "node": ">=20" },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/js/*.test.mjs",
+    "test:python": "uv run --python 3.14 --with pytest-homeassistant-custom-component --with pillow --with home-assistant-frontend pytest test/python -q",
+    "check": "node scripts/build.mjs --check && npm test",
+    "replay": "node scripts/replay.mjs"
+  },
+  "devDependencies": {
+    "@rollup/plugin-terser": "1.0.2",
+    "leaflet": "1.9.4",
+    "rollup": "4.68.2"
   }
 }

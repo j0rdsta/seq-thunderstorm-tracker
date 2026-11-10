@@ -9,12 +9,24 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  javascript:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+      - run: npm ci
+      # The built userscripts and card are committed: fail if they are out of date.
+      - run: node scripts/build.mjs --check
       - run: node --check seq-thunderstorm-tracker.user.js
+      - run: node --check seq-thunderstorm-tracker-ha-bridge.user.js
       - run: npm test
+
+  home-assistant:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv run --python 3.14 --with pytest-homeassistant-custom-component --with pillow --with home-assistant-frontend pytest test/python -q

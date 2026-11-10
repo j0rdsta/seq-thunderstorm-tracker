@@ -1,0 +1,26 @@
+// ==UserScript==
+// @name         BoM SEQ Thunderstorm Tracker: Home Assistant bridge
+// @namespace    https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @version      {{version}}
+// @description  Sends storm positions from the Bureau of Meteorology's Thunderstorm Tracker (Southeast Queensland pilot) to your own Home Assistant, from your browser, while a bom.gov.au tab is open.
+// @author       Jordan Gardiner
+// @license      MIT
+// @match        https://www.bom.gov.au/location/*
+// @match        https://www.bom.gov.au/qld/forecasts/brisbane-thunderstorms.shtml
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_registerMenuCommand
+// @connect      *
+// @run-at       document-idle
+// @noframes
+// @homepageURL  https://github.com/j0rdsta/seq-thunderstorm-tracker
+// @supportURL   https://github.com/j0rdsta/seq-thunderstorm-tracker/issues
+// @updateURL    https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker-ha-bridge.user.js
+// @downloadURL  https://github.com/j0rdsta/seq-thunderstorm-tracker/raw/main/seq-thunderstorm-tracker-ha-bridge.user.js
+// ==/UserScript==
+
+/* Not affiliated with or endorsed by the Bureau of Meteorology.
+ * Tracker imagery © Commonwealth of Australia, Bureau of Meteorology. This script sends it only to
+ * the Home Assistant address you give it. `@connect *` is there because that address is yours to
+ * choose: your userscript manager asks before the first request to it. */

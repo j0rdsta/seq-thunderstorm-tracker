@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. This project uses [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-11-11
+
+### Added
+- **Home Assistant integration** (`custom_components/seq_thunderstorm_tracker`): distance to the nearest
+  tracked storm and to the Bureau's forecast track for each zone or person you choose, a *Storm nearby*
+  sensor, the tracker picture, and a map cropped around each place. Home Assistant never fetches
+  bom.gov.au. When the data is more than 15 minutes old the sensors go unavailable instead of showing
+  old storms or clear skies.
+- **Dashboard card**, installed with the integration: the tracker on an OpenStreetMap base map with your
+  places and an alert ring. The picture is loaded by the viewer's browser from the Bureau and keyed with
+  an SVG filter, so the card works without the bridge. Optional RainViewer rain radar underneath.
+- **Bridge userscript** (`seq-thunderstorm-tracker-ha-bridge.user.js`): runs on a bom.gov.au tab and posts
+  storm positions to your Home Assistant webhook. One look at the tracker every 5 minutes across all tabs.
+- **Notification blueprint**: a phone notification, with the map, when a storm comes within a distance.
+- **iOS widget** for Scriptable: the map and the distance on the Home Screen or Lock Screen.
+- `scripts/replay.mjs` posts a saved tracker image to a webhook, for testing without a storm.
+
+### Changed
+- The repo is now organised around a shared core (`packages/core`). The overlay userscript is built from
+  it with Rollup, and behaves as before. The built file stays at the same address, so installed copies
+  keep updating.
+- Storm detection also measures each storm's oval (size and orientation), which is what the Home
+  Assistant distances are measured to.
+
 ## [0.5.0] - 2026-11-03
 
 ### Changed

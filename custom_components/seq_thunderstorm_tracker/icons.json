@@ -1,0 +1,17 @@
+{
+  "entity": {
+    "sensor": {
+      "storms": { "default": "mdi:weather-lightning" },
+      "issued": { "default": "mdi:clock-outline" },
+      "nearest_storm": { "default": "mdi:weather-lightning" },
+      "nearest_forecast_track": { "default": "mdi:arrow-top-right-thin-circle-outline" }
+    },
+    "binary_sensor": {
+      "storm_nearby": { "default": "mdi:weather-lightning-rainy", "state": { "off": "mdi:weather-partly-cloudy" } }
+    },
+    "image": {
+      "tracker": { "default": "mdi:radar" },
+      "map": { "default": "mdi:map-marker-radius" }
+    }
+  }
+}
